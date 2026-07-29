@@ -29,7 +29,7 @@
  * IA_MEDIATYPE.
  */
 
-import { AwsClient } from "npm:aws4fetch@1.0.20";
+import { AwsClient } from "https://esm.sh/aws4fetch@1.0.20";
 
 // ---------- R2 (S3-compatible API) client ----------
 //
@@ -190,16 +190,12 @@ interface Board {
  * invoked, same as the original Worker version did.
  */
 function getBoards(): Board[] {
-  const boards: Board[] = [];
-  const defaultHost = Deno.env.get("BOARD_HOST");
-  const defaultPath = Deno.env.get("BOARD_PATH");
-  if (defaultHost && defaultPath) boards.push({ host: defaultHost, path: defaultPath });
-  boards.push(
+  return [
+    { host: "img.2chan.net", path: "/b/" },
     { host: "may.2chan.net", path: "/b/" },
     { host: "jun.2chan.net", path: "/jun/" },
-    { host: "dec.2chan.net", path: "/dec/" }
-  );
-  return boards;
+    { host: "dec.2chan.net", path: "/dec/" },
+  ];
 }
 
 function boardSlug(board: Board) {
@@ -246,6 +242,24 @@ interface IaResult {
   detailsUrl?: string;
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * IAS3 throttles uploads per access key across your whole account (not
+ * per-item), returning 503 with `<Code>SlowDown</Code>` /
+ * `accesskey_tasks_queued exceeds rationed amount` once too many upload
+ * tasks are queued at once. This shows up more on later boards in a run
+ * (their uploads land after earlier boards' tasks are already queued),
+ * not because anything is wrong with those uploads specifically. Retry
+ * with exponential backoff rather than giving up on the first SlowDown —
+ * IA's own guidance for this error is "wait and retry", not "reduce
+ * request rate mid-flight" in some more granular way.
+ */
+const IA_SLOWDOWN_RETRIES = 5;
+const IA_SLOWDOWN_BASE_DELAY_MS = 10_000; // 10s, 20s, 40s, 80s, 160s
+
 async function uploadToInternetArchive(
   board: Board,
   filename: string,
@@ -265,36 +279,49 @@ async function uploadToInternetArchive(
     Deno.env.get("IA_ITEM_DESCRIPTION") ||
     `Archived Futaba Channel threads from ${board.host}${board.path}. Uploaded automatically by futaba-archiver.`;
 
-  let res: Response;
-  try {
-    res = await fetch(uploadUrl, {
-      method: "PUT",
-      redirect: "follow", // IAS3 commonly issues 307s during upload
-      headers: {
-        Authorization: `LOW ${accessKey}:${secretKey}`,
-        "x-amz-auto-make-bucket": "1",
-        "x-archive-ignore-preexisting-bucket": "1",
-        // NOTE: test_collection auto-deletes items after 30 days — do not
-        // use it for anything you want to keep.
-        "x-archive-meta-collection": Deno.env.get("IA_COLLECTION") || "opensource",
-        "x-archive-meta-mediatype": Deno.env.get("IA_MEDIATYPE") || "web",
-        "x-archive-meta-title": iaHeaderValue(title),
-        "x-archive-meta-description": iaHeaderValue(description),
-        "x-archive-meta-subject": "futaba;imageboard;archive",
-        "x-archive-queue-derive": "0",
-        "Content-Type": contentType,
-      },
-      body: buffer,
-    });
-  } catch (e) {
-    return { ok: false, reason: `IA upload request failed: ${e}` };
+  for (let attempt = 0; attempt <= IA_SLOWDOWN_RETRIES; attempt++) {
+    let res: Response;
+    try {
+      res = await fetch(uploadUrl, {
+        method: "PUT",
+        redirect: "follow", // IAS3 commonly issues 307s during upload
+        headers: {
+          Authorization: `LOW ${accessKey}:${secretKey}`,
+          "x-amz-auto-make-bucket": "1",
+          "x-archive-ignore-preexisting-bucket": "1",
+          // NOTE: test_collection auto-deletes items after 30 days — do not
+          // use it for anything you want to keep.
+          "x-archive-meta-collection": Deno.env.get("IA_COLLECTION") || "opensource",
+          "x-archive-meta-mediatype": Deno.env.get("IA_MEDIATYPE") || "web",
+          "x-archive-meta-title": iaHeaderValue(title),
+          "x-archive-meta-description": iaHeaderValue(description),
+          "x-archive-meta-subject": "futaba;imageboard;archive",
+          "x-archive-queue-derive": "0",
+          "Content-Type": contentType,
+        },
+        body: buffer,
+      });
+    } catch (e) {
+      return { ok: false, reason: `IA upload request failed: ${e}` };
+    }
+
+    if (res.ok) {
+      return { ok: true, status: res.status, identifier, filename, detailsUrl: `https://archive.org/details/${identifier}` };
+    }
+
+    const text = await res.text().catch(() => "");
+    const isSlowDown = res.status === 503 && /SlowDown/i.test(text);
+    if (!isSlowDown || attempt === IA_SLOWDOWN_RETRIES) {
+      return { ok: false, status: res.status, reason: text.slice(0, 500), identifier, filename };
+    }
+
+    const delay = IA_SLOWDOWN_BASE_DELAY_MS * 2 ** attempt;
+    console.log(`[${identifier}] IA SlowDown on ${filename}, retrying in ${delay / 1000}s (attempt ${attempt + 1}/${IA_SLOWDOWN_RETRIES})`);
+    await sleep(delay);
   }
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    return { ok: false, status: res.status, reason: text.slice(0, 500), identifier, filename };
-  }
-  return { ok: true, status: res.status, identifier, filename, detailsUrl: `https://archive.org/details/${identifier}` };
+  // Unreachable — loop always returns, but keeps TypeScript happy.
+  return { ok: false, reason: "exhausted retries" };
 }
 
 interface IaSyncedEntry {
@@ -346,6 +373,14 @@ async function syncBoard(board: Board, maxPerBoard: number, deleteAfterSync: boo
     } catch (e) {
       results.push({ key: obj.key, ok: false, reason: String(e) });
     }
+
+    // Small pacing delay between uploads (not just on failure) — spreads
+    // out how fast tasks land in IA's per-access-key queue in the first
+    // place, so later boards in this same run are less likely to walk
+    // straight into a SlowDown that earlier boards' uploads already
+    // primed. Cheap insurance against the retry loop above having to do
+    // much work.
+    await sleep(1500);
   }
 
   if (changed) await r2PutJson(iaSyncedKey, iaSynced);
