@@ -737,8 +737,3 @@ async function main() {
   // the GitHub UI, independent of whether the callback succeeded.
   Deno.exit(result.ok ? 0 : 1);
 }
-
-main().catch((e) => {
-  console.error(`Fatal error: ${e}`);
-  Deno.exit(1);
-});
