@@ -1,17 +1,18 @@
 name: Poll Catalog and Archive Threads
 
 # Multiple boards, each on its own cron — mirrors what used to be
-# Cloudflare Cron Triggers + boardForCron() in cf-worker/index.js. Keep
-# this list in sync with ADDITIONAL_BOARDS there (host/path/cadence) and
-# with getBoards() in deno-service/sync-ia.ts.
+# Cloudflare Cron Triggers + boardForCron() in cf-worker/index.js. All
+# four boards (including the default) are hardcoded — keep this list in
+# sync with ADDITIONAL_BOARDS there (host/path/cadence) and with
+# getBoards() in deno-service/sync-ia.ts.
 #
 # The FIRST cron entry below is the "default" board — it's the one that
-# falls through to the vars.BOARD_HOST/BOARD_PATH repo variables in the
-# "Resolve board" step, the same way cf-worker/index.js's boardForCron()
-# treated the board with `cron: null` as the fallback.
+# falls through to the hardcoded img.2chan.net/b/ values in the "Resolve
+# board" step, the same way cf-worker/index.js's boardForCron() treated
+# the board with `cron: null` as the fallback.
 on:
   schedule:
-    - cron: "*/5 * * * *" # default board (BOARD_HOST/BOARD_PATH vars)
+    - cron: "*/5 * * * *" # img.2chan.net/b/ (default board)
     - cron: "*/6 * * * *" # may.2chan.net/b/
     - cron: "*/16 * * * *" # jun.2chan.net/jun/
     - cron: "*/18 * * * *" # dec.2chan.net/dec/
@@ -59,7 +60,7 @@ jobs:
           elif [ -n "$INPUT_HOST" ]; then
             HOST="$INPUT_HOST"; PATH_="$INPUT_PATH"
           else
-            HOST="${{ vars.BOARD_HOST }}"; PATH_="${{ vars.BOARD_PATH }}"
+            HOST="img.2chan.net"; PATH_="/b/"
           fi
           if [ -z "$HOST" ] || [ -z "$PATH_" ]; then
             echo "::error::Could not resolve a board host/path for this trigger" >&2
