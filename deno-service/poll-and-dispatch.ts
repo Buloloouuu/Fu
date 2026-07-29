@@ -27,7 +27,7 @@
  * CXYL_COOKIE, OFFLOAD_BASE_URL, OFFLOAD_BASE_URL_F3, WORKER_CALLBACK_URL.
  */
 
-import { AwsClient } from "https://esm.sh/aws4fetch@1.0.20";
+import { AwsClient } from "npm:aws4fetch@1.0.20";
 
 // ---------- R2 (S3-compatible API) client ----------
 //
