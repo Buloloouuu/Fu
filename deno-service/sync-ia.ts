@@ -182,8 +182,9 @@ interface Board {
 }
 
 /**
- * Keep this board list in sync with ADDITIONAL_BOARDS + BOARD_HOST/
- * BOARD_PATH in cf-worker/index.js, and with the cron table in
+ * All four boards are hardcoded here — keep this list in sync with
+ * ADDITIONAL_BOARDS in cf-worker/index.js (img.2chan.net/b/ included, no
+ * longer env-driven there either) and with the cron table in
  * .github/workflows/poll-and-archive.yml. Unlike the poll script (which
  * only ever handles the one board matching whichever cron fired), this
  * sync pass walks every configured board in a single run each time it's
@@ -329,19 +330,37 @@ interface IaSyncedEntry {
   syncedAt: number;
 }
 
-async function syncBoard(board: Board, maxPerBoard: number, deleteAfterSync: boolean) {
-  const prefix = `${board.host}${board.path}`.replace(/\/+/g, "/");
-  const objects = await r2List(prefix);
+interface BoardQueue {
+  board: Board;
+  items: R2ListedObject[];
+  index: number;
+  iaSyncedKey: string;
+  iaSynced: Record<string, IaSyncedEntry>;
+  iaSyncedChanged: boolean;
+  processed: number;
+  results: (IaResult & { key: string })[];
+}
 
+async function prepareBoardQueue(board: Board): Promise<BoardQueue> {
+  const prefix = `${board.host}${board.path}`.replace(/\/+/g, "/");
+  const items = await r2List(prefix);
   const iaSyncedKey = iaSyncedKeyFor(board);
   const iaSynced = (await r2GetJson<Record<string, IaSyncedEntry>>(iaSyncedKey)) || {};
-  let changed = false;
+  return { board, items, index: 0, iaSyncedKey, iaSynced, iaSyncedChanged: false, processed: 0, results: [] };
+}
 
-  const results: (IaResult & { key: string })[] = [];
-  let processed = 0;
-
-  for (const obj of objects) {
-    if (processed >= maxPerBoard) break;
+/**
+ * Pull the next archivable object out of a queue for the round-robin loop
+ * below, skipping "_state/..." keys and anything that doesn't match the
+ * expected zip/html filename pattern (neither counts against the
+ * per-board cap). Returns null once the queue has nothing left to offer —
+ * either its item list is exhausted or it's hit maxPerBoard — which is
+ * how the round-robin loop knows to stop giving this queue turns.
+ */
+function nextCandidate(q: BoardQueue, maxPerBoard: number): { threadId: string; ext: string; obj: R2ListedObject } | null {
+  if (q.processed >= maxPerBoard) return null;
+  while (q.index < q.items.length) {
+    const obj = q.items[q.index++];
     // "_state/..." keys live under a different top-level prefix than any
     // board's own host+path prefix, so they shouldn't appear in this
     // listing at all — this is a harmless extra guard, not load-bearing.
@@ -353,39 +372,34 @@ async function syncBoard(board: Board, maxPerBoard: number, deleteAfterSync: boo
     const match = /([^/]+)\.(zip|html)$/i.exec(obj.key);
     if (!match) continue;
     const [, threadId, ext] = match;
-    processed++;
-
-    const contentType = ext.toLowerCase() === "zip" ? "application/zip" : "text/html; charset=utf-8";
-    const filename = iaFilenameFor(board, threadId, ext);
-
-    try {
-      const object = await r2Get(obj.key);
-      if (!object) continue;
-
-      const ia = await uploadToInternetArchive(board, filename, object.buffer, contentType);
-      results.push({ key: obj.key, ...ia });
-
-      if (ia.ok && ia.identifier) {
-        iaSynced[obj.key] = { identifier: ia.identifier, syncedAt: Date.now() };
-        changed = true;
-        if (deleteAfterSync) await r2Delete(obj.key);
-      }
-    } catch (e) {
-      results.push({ key: obj.key, ok: false, reason: String(e) });
-    }
-
-    // Small pacing delay between uploads (not just on failure) — spreads
-    // out how fast tasks land in IA's per-access-key queue in the first
-    // place, so later boards in this same run are less likely to walk
-    // straight into a SlowDown that earlier boards' uploads already
-    // primed. Cheap insurance against the retry loop above having to do
-    // much work.
-    await sleep(1500);
+    return { threadId, ext, obj };
   }
+  return null;
+}
 
-  if (changed) await r2PutJson(iaSyncedKey, iaSynced);
+async function uploadOne(q: BoardQueue, candidate: { threadId: string; ext: string; obj: R2ListedObject }, deleteAfterSync: boolean) {
+  const { threadId, ext, obj } = candidate;
+  q.processed++;
 
-  return { board: `${board.host}${board.path}`, scanned: objects.length, processed, results };
+  const contentType = ext.toLowerCase() === "zip" ? "application/zip" : "text/html; charset=utf-8";
+  const filename = iaFilenameFor(q.board, threadId, ext);
+
+  try {
+    const object = await r2Get(obj.key);
+    if (!object) return;
+
+    const ia = await uploadToInternetArchive(q.board, filename, object.buffer, contentType);
+    q.results.push({ key: obj.key, ...ia });
+
+    if (ia.ok && ia.identifier) {
+      console.log(`[${q.board.host}${q.board.path}] uploaded ${filename} -> ${ia.detailsUrl} (file: https://archive.org/download/${ia.identifier}/${filename})`);
+      q.iaSynced[obj.key] = { identifier: ia.identifier, syncedAt: Date.now() };
+      q.iaSyncedChanged = true;
+      if (deleteAfterSync) await r2Delete(obj.key);
+    }
+  } catch (e) {
+    q.results.push({ key: obj.key, ok: false, reason: String(e) });
+  }
 }
 
 async function main() {
@@ -393,16 +407,45 @@ async function main() {
   const deleteAfterSync = Deno.env.get("DELETE_FROM_R2_AFTER_SYNC") !== "false";
 
   const boards = getBoards();
+  const queues = await Promise.all(boards.map(prepareBoardQueue));
+
+  // Round-robin across boards, one upload at a time — img, may, jun, dec,
+  // img, may, jun, dec, ... — instead of fully draining one board before
+  // starting the next. This used to be a plain `for (const board of
+  // boards)` loop, which meant whichever board came last always waited
+  // behind every other board's entire quota before its own uploads even
+  // started, and IA's per-access-key task queue saw one big burst per
+  // board rather than a spread-out stream. Interleaving doesn't change
+  // how many objects each board is allowed per run (still maxPerBoard
+  // each), just the order they're attempted in.
+  let remaining = true;
+  while (remaining) {
+    remaining = false;
+    for (const q of queues) {
+      const candidate = nextCandidate(q, maxPerBoard);
+      if (!candidate) continue;
+      remaining = true;
+      await uploadOne(q, candidate, deleteAfterSync);
+      // Pacing delay between every upload, regardless of which board it
+      // belongs to — same role as before, just now spacing out the
+      // interleaved stream instead of one board's back-to-back run.
+      await sleep(1500);
+    }
+  }
+
   let anyFailed = false;
+  for (const q of queues) {
+    if (q.iaSyncedChanged) await r2PutJson(q.iaSyncedKey, q.iaSynced);
 
-  for (const board of boards) {
-    const result = await syncBoard(board, maxPerBoard, deleteAfterSync);
-    console.log(`[${result.board}] synced ${result.processed}/${result.scanned} object(s) considered`);
+    console.log(
+      `[${q.board.host}${q.board.path}] synced ${q.processed}/${q.items.length} object(s) considered ` +
+        `(item: https://archive.org/details/${iaItemIdentifier(q.board)})`
+    );
 
-    const failed = result.results.filter((r) => !r.ok);
+    const failed = q.results.filter((r) => !r.ok);
     if (failed.length > 0) {
       anyFailed = true;
-      console.error(`[${result.board}] ${failed.length} item(s) failed:`, JSON.stringify(failed).slice(0, 2000));
+      console.error(`[${q.board.host}${q.board.path}] ${failed.length} item(s) failed:`, JSON.stringify(failed).slice(0, 2000));
     }
   }
 
