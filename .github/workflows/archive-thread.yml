@@ -1,0 +1,126 @@
+name: Archive Futaba Thread
+# Triggered by the Cloudflare Worker via GitHub's repository_dispatch API
+# (see cf-worker/index.js, dispatchArchiveBatchViaGitHubActions). ONE event
+# now carries a BATCH of threads under client_payload.threads =
+# [{threadId, replies}, ...] rather than a single thread, so this workflow
+# fans that array back out into one matrix job per thread.
+#
+# workflow_dispatch is still wired up for manual testing from the Actions
+# tab, and accepts EITHER shape in the `payload` input:
+#   - a full batch payload, same shape as the Worker sends:
+#       {"threads":[{"threadId":"...","replies":0}],"boardHost":"...",
+#        "boardPath":"...","userAgent":"...","maxAssetsPerThread":40,
+#        "maxAssetBytes":0,"offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
+#        "callbackUrl":"https://your-worker.workers.dev/thread-complete"}
+#   - or the older single-thread shape, for a quick one-off test:
+#       {"threadId":"...","boardHost":"...","boardPath":"...","replies":0,
+#        "userAgent":"...","maxAssetsPerThread":40,"maxAssetBytes":0,
+#        "offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
+#        "callbackUrl":"https://your-worker.workers.dev/thread-complete"}
+# The "prepare" job below detects which shape it got and normalizes both
+# into the same {threads, shared} split, so "archive" only ever has to
+# handle one case.
+on:
+  repository_dispatch:
+    types: [archive-thread]
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: >
+          JSON payload — either a full batch (same shape as the Worker's
+          client_payload, with a "threads" array) or a single-thread
+          payload (top-level "threadId"/"replies") for a quick manual test.
+        required: true
+
+jobs:
+  # Normalizes both trigger types / both payload shapes into:
+  #   - threads_matrix: a compact JSON array of {threadId, replies}
+  #   - shared: everything else (boardHost, boardPath, userAgent,
+  #     maxAssetsPerThread, maxAssetBytes, offloadUploaders, callbackUrl),
+  #     common to every thread in this run
+  # so the "archive" job's matrix and per-thread payload assembly stay
+  # identical regardless of how this run was triggered.
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      threads_matrix: ${{ steps.build.outputs.threads_matrix }}
+      shared: ${{ steps.build.outputs.shared }}
+    steps:
+      - name: Resolve and normalize payload
+        id: build
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            printf '%s' '${{ inputs.payload }}' > payload.json
+          else
+            cat <<'EOF' > payload.json
+          ${{ toJson(github.event.client_payload) }}
+          EOF
+          fi
+          # Fail fast with a clear error if the payload isn't valid JSON,
+          # rather than letting archive-thread.ts's generic parse error
+          # obscure what went wrong at the workflow level.
+          jq empty payload.json
+
+          if jq -e 'has("threads")' payload.json > /dev/null; then
+            # Batch shape (from the Worker, or a manually pasted batch).
+            jq -c '[.threads[] | {threadId, replies}]' payload.json > threads.json
+            jq -c 'del(.threads)' payload.json > shared.json
+          else
+            # Legacy single-thread shape (manual test) — wrap it into a
+            # one-entry "threads" array so the matrix below is identical
+            # either way.
+            jq -c '[{threadId, replies}]' payload.json > threads.json
+            jq -c 'del(.threadId, .replies)' payload.json > shared.json
+          fi
+
+          echo "threads_matrix=$(cat threads.json)" >> "$GITHUB_OUTPUT"
+          echo "shared=$(cat shared.json)" >> "$GITHUB_OUTPUT"
+
+  archive:
+    needs: prepare
+    runs-on: ubuntu-latest
+    # Generous but bounded — a single thread with dozens of large video
+    # assets should still finish in well under this on a standard runner.
+    timeout-minutes: 15
+    strategy:
+      # A failed thread shouldn't cancel the rest of the batch — each
+      # thread's outcome is independent and reported separately via its
+      # own /thread-complete callback.
+      fail-fast: false
+      # Caps how many threads from this one batch archive concurrently.
+      # GitHub's own ceiling is 256 matrix jobs per run; this is a lower,
+      # source-site-friendly limit so one batch doesn't hit Futaba (or the
+      # offload-uploader hosts) with dozens of simultaneous fetches at once.
+      max-parallel: 10
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.threads_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      # Merges this matrix entry's {threadId, replies} back into the
+      # shared fields from "prepare", producing exactly the same
+      # single-thread PAYLOAD_JSON shape archive-thread.ts already expects
+      # — that script needed no changes for batching.
+      - name: Build payload for this thread
+        run: |
+          echo '${{ needs.prepare.outputs.shared }}' | jq \
+            --arg threadId "${{ matrix.threadId }}" \
+            --argjson replies ${{ matrix.replies }} \
+            '. + {threadId: $threadId, replies: $replies}' > payload.json
+          jq empty payload.json
+      - name: Archive thread
+        env:
+          PAYLOAD_JSON_FILE: payload.json
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          CALLBACK_SECRET: ${{ secrets.W_SHARED_SECRET }}
+        run: |
+          export PAYLOAD_JSON="$(cat "$PAYLOAD_JSON_FILE")"
+          deno run --allow-net --allow-env deno-service/archive-thread.ts
