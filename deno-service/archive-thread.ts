@@ -7,7 +7,7 @@
  * Cloudflare Worker called with `POST /archive` and awaited synchronously.
  * It's now a one-shot CLI script meant to run inside a GitHub Actions job,
  * triggered per-thread by a `repository_dispatch` event that the Worker
- * sends (see cf-worker/index.js's dispatchArchiveThreadViaGitHubActions).
+ * (or the Deno catalog service) sends.
  *
  * Because GitHub's repository_dispatch API is fire-and-forget (it just
  * confirms the event was accepted, with no way to await a result), this
@@ -16,8 +16,35 @@
  * authenticated with a shared secret. The Worker uses that callback to
  * update its "archived"/"pending" state blobs — see cf-worker/index.js.
  *
+ * STORAGE CHANGE — IA-FIRST, R2 AS FALLBACK ONLY:
+ *   Previously this job always wrote the built zip to R2, and a separate
+ *   scheduled sweep on the Worker (syncToInternetArchive()) walked R2
+ *   later and pushed everything to Internet Archive in bulk.
+ *
+ *   Now this job tries Internet Archive FIRST, immediately, right here —
+ *   no R2 round-trip, no waiting on a later sweep. R2 is only touched if
+ *   the IA PUT itself fails (IA outage, rate limiting, missing/bad IA
+ *   credentials, oversized item, etc.), as a fallback so the zip isn't
+ *   just dropped on the floor. Anything that does land in R2 this way is
+ *   still picked up and retried by the Worker's existing
+ *   syncToInternetArchive() sweep, unchanged — that code path still
+ *   exists specifically to catch these fallback cases.
+ *
+ *   The result reported to the Worker's /thread-complete callback now
+ *   includes a `storage: "ia" | "r2"` field so the Worker can tell which
+ *   path a given thread took. `key` is repurposed depending on storage:
+ *   for `"ia"` it's `"<identifier>/<filename>"` on archive.org (and
+ *   `detailsUrl` is also included); for `"r2"` it's the R2 object key,
+ *   same as before. NOTE: the Worker's /thread-complete handler and
+ *   /download endpoint don't yet know about `storage`/`detailsUrl` —
+ *   they'll happily store whatever `key` they're given, but anything
+ *   that reads that state expecting an R2 key (e.g. /download) will need
+ *   a small update to branch on `storage` before this is fully wired
+ *   end-to-end. Flagging this because it's a real follow-up, not because
+ *   it blocks this change.
+ *
  * Everything else — HTML fetching, offload-uploader resolution, ZIP
- * building, R2 upload — is unchanged from the Deno Deploy version.
+ * building — is unchanged from before.
  *
  * INPUT: a single JSON blob in the PAYLOAD_JSON environment variable,
  * shaped like:
@@ -33,14 +60,31 @@
  *     "offloadUploaders": [{ "prefix": "fu", "baseUrl": "..." }],
  *     "callbackUrl": "https://your-worker.workers.dev/thread-complete"
  *   }
- * The Worker builds this payload and sends it as GitHub's `client_payload`;
- * the workflow YAML (.github/workflows/archive-thread.yml) forwards it
- * into PAYLOAD_JSON verbatim via `toJson(github.event.client_payload)`, so
- * this script never needs to parse individual env vars per field.
+ * The dispatcher builds this payload and sends it as GitHub's
+ * `client_payload`; the workflow YAML (.github/workflows/archive-thread.yml)
+ * forwards it into PAYLOAD_JSON verbatim via
+ * `toJson(github.event.client_payload)`, so this script never needs to
+ * parse individual env vars per field.
  *
  * Required environment variables (set as GitHub Actions repo/environment
  * secrets, NOT included in the payload):
+ *   IA_ACCESS_KEY, IA_SECRET_KEY  — Internet Archive S3-compatible API
+ *                     keys (https://archive.org/account/s3.php). Primary
+ *                     storage target. If either is missing, IA upload is
+ *                     skipped entirely and every thread falls straight
+ *                     through to the R2 fallback path (logged, not
+ *                     treated as an error).
+ *   IA_IDENTIFIER, IA_COLLECTION, IA_MEDIATYPE, IA_ITEM_TITLE,
+ *   IA_ITEM_DESCRIPTION
+ *                     — optional; same meaning/defaults as the Worker's
+ *                     existing IA-sync code. IA_IDENTIFIER, if set, is
+ *                     used for every board (all threads land in one IA
+ *                     item); if unset, an identifier is derived per-board
+ *                     the same way the Worker derives one, so this can be
+ *                     left unset with no behavior change from that logic.
  *   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
+ *                     — fallback storage target, only touched when the IA
+ *                     PUT fails.
  *   CALLBACK_SECRET — must match the Worker's W_SHARED_SECRET; sent as
  *                     `Authorization: Bearer ...` on the callback POST.
  */
@@ -176,18 +220,6 @@ function extractStylesheetUrls(html: string) {
   return urls;
 }
 
-/**
- * NOTE ON THE CSS CACHE: the Deno Deploy version cached each board's
- * shared stylesheet in a module-level Map so a warm isolate could skip
- * re-fetching it across several /archive calls in a row. That trick
- * doesn't apply here — each GitHub Actions job is a fresh process (a new
- * VM), so there's no "warm instance" to carry a cache between threads.
- * The stylesheet is simply fetched fresh, once, per job. If this ever
- * becomes worth optimizing, `actions/cache` keyed on board host could
- * persist it across job runs, but for a single small CSS file it isn't
- * worth the added complexity.
- */
-
 // ---------- Offload uploaders (generic — config comes from the payload) ----------
 
 const OFFLOAD_EXTENSIONS = "jpe?g|png|gif|webp|bmp|webm|mp4|txt";
@@ -202,7 +234,7 @@ interface OffloadUploader {
  * uploader's base URL prepended to actually be fetchable. Scans the raw
  * HTML/text for these patterns (not just tag attributes) since they can
  * appear as plain text in a post body too. `uploaders` is whatever list
- * the Worker sent in this request — this function has no built-in
+ * the dispatcher sent in this request — this function has no built-in
  * knowledge of which prefixes exist.
  */
 function extractOffloadedAssetUrls(html: string, uploaders: OffloadUploader[]) {
@@ -525,7 +557,125 @@ async function buildZip(entries: ZipEntry[]) {
   return result;
 }
 
-// ---------- R2 upload (S3-compatible API, direct from Deno) ----------
+// ---------- Internet Archive (IAS3) upload — PRIMARY storage target ----------
+//
+// Mirrors cf-worker/index.js's uploadToInternetArchive() / iaItemIdentifier()
+// / iaFilenameFor() / sanitizeIaIdentifierPart() / iaHeaderValue() functions
+// exactly, so identifier derivation and metadata headers behave the same
+// way here as they do in the Worker's own (now-fallback-only-relevant)
+// syncToInternetArchive() sweep. IA's S3-compatible endpoint accepts a
+// plain PUT with a "LOW key:secret" Authorization header — no AWS SigV4
+// needed, so this is a bare fetch(), unlike the R2 calls below which go
+// through aws4fetch's AwsClient.
+
+function sanitizeIaIdentifierPart(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "");
+}
+
+function iaHeaderValue(str: string): string {
+  if (/^[\x20-\x7E]*$/.test(str)) return str;
+  return `uri(${encodeURIComponent(str)})`;
+}
+
+function iaItemIdentifier(boardHost: string, boardPath: string): string {
+  const configured = Deno.env.get("IA_IDENTIFIER");
+  if (configured) {
+    const sanitized = sanitizeIaIdentifierPart(configured);
+    if (sanitized) return sanitized.slice(0, 100).replace(/-+$/, "");
+  }
+  const slug = sanitizeIaIdentifierPart(`${boardHost}${boardPath}`);
+  return `futaba-archive-${slug}`.slice(0, 100).replace(/-+$/, "");
+}
+
+function iaFilenameFor(boardHost: string, boardPath: string, threadId: string): string {
+  const slug = sanitizeIaIdentifierPart(`${boardHost}${boardPath}`);
+  return `${slug}_${threadId}.zip`;
+}
+
+interface IaUploadResult {
+  ok: boolean;
+  status?: number;
+  reason?: string;
+  identifier?: string;
+  filename?: string;
+  detailsUrl?: string;
+}
+
+/**
+ * PUT the built zip straight to Internet Archive. Never throws — every
+ * failure mode (missing creds, network error, non-2xx response) comes
+ * back as `{ ok: false, reason }` so the caller can fall through to R2
+ * cleanly instead of needing a try/catch at the call site.
+ */
+async function uploadToInternetArchive(
+  boardHost: string,
+  boardPath: string,
+  threadId: string,
+  buffer: Uint8Array
+): Promise<IaUploadResult> {
+  const accessKey = Deno.env.get("IA_ACCESS_KEY");
+  const secretKey = Deno.env.get("IA_SECRET_KEY");
+  if (!accessKey || !secretKey) {
+    return { ok: false, reason: "IA_ACCESS_KEY/IA_SECRET_KEY not configured" };
+  }
+
+  const identifier = iaItemIdentifier(boardHost, boardPath);
+  const filename = iaFilenameFor(boardHost, boardPath, threadId);
+  const uploadUrl = `https://s3.us.archive.org/${identifier}/${filename}`;
+
+  const title = Deno.env.get("IA_ITEM_TITLE") || `Futaba thread archive (${boardHost}${boardPath})`;
+  const description =
+    Deno.env.get("IA_ITEM_DESCRIPTION") ||
+    `Archived Futaba Channel threads from ${boardHost}${boardPath}, each saved as a ZIP (index.html + assets/). Uploaded automatically by futaba-archiver.`;
+
+  let res: Response;
+  try {
+    res = await fetch(uploadUrl, {
+      method: "PUT",
+      redirect: "follow",
+      headers: {
+        Authorization: `LOW ${accessKey}:${secretKey}`,
+        "x-amz-auto-make-bucket": "1",
+        "x-archive-ignore-preexisting-bucket": "1",
+        "x-archive-meta-collection": Deno.env.get("IA_COLLECTION") || "opensource",
+        "x-archive-meta-mediatype": Deno.env.get("IA_MEDIATYPE") || "web",
+        "x-archive-meta-title": iaHeaderValue(title),
+        "x-archive-meta-description": iaHeaderValue(description),
+        "x-archive-meta-subject": "futaba;imageboard;archive",
+        "x-archive-queue-derive": "0",
+        "Content-Type": "application/zip",
+      },
+      body: buffer,
+    });
+  } catch (e) {
+    return { ok: false, reason: `IA upload request failed: ${e}` };
+  }
+
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => "");
+    return { ok: false, status: res.status, reason: bodyText.slice(0, 500), identifier, filename };
+  }
+
+  return {
+    ok: true,
+    status: res.status,
+    identifier,
+    filename,
+    detailsUrl: `https://archive.org/details/${identifier}`,
+  };
+}
+
+// ---------- R2 upload (S3-compatible API, direct from Deno) — FALLBACK ONLY ----------
+//
+// Only reached now when uploadToInternetArchive() above fails. Kept
+// byte-for-byte identical to the old primary-path version otherwise, so
+// anything that later reads these R2 objects (e.g. the Worker's existing
+// syncToInternetArchive() sweep, which now effectively becomes "retry
+// whatever fell through to R2") keeps working unchanged.
 
 function requireEnv(name: string): string {
   const v = Deno.env.get(name);
@@ -567,7 +717,7 @@ async function putToR2(key: string, body: Uint8Array, contentType: string) {
   }
 }
 
-// ---------- Core per-thread archive logic (unchanged from Deno Deploy) ----------
+// ---------- Core per-thread archive logic ----------
 
 interface ArchiveRequest {
   threadId: string;
@@ -579,7 +729,16 @@ interface ArchiveRequest {
   offloadUploaders?: OffloadUploader[];
 }
 
-async function archiveThread(req: ArchiveRequest) {
+interface ArchiveResult {
+  ok: boolean;
+  reason?: string;
+  storage?: "ia" | "r2";
+  key?: string;
+  detailsUrl?: string;
+  assetCount?: number;
+}
+
+async function archiveThread(req: ArchiveRequest): Promise<ArchiveResult> {
   const {
     threadId,
     boardHost,
@@ -600,7 +759,7 @@ async function archiveThread(req: ArchiveRequest) {
   const { text: rawHtml } = decodeBuffer(buffer, res.headers.get("content-type"));
 
   // Fetch bare "<prefix>NNNN.ext" mentions too (including ones only in
-  // plain post text), for every uploader the Worker told us about.
+  // plain post text), for every uploader the dispatcher told us about.
   const offloadedUrls = extractOffloadedAssetUrls(rawHtml, offloadUploaders);
 
   // Resolve bare filenames appearing in src/href to their real absolute
@@ -653,14 +812,40 @@ async function archiveThread(req: ArchiveRequest) {
 
   const zipBytes = await buildZip(zipEntries);
 
-  const key = `${boardHost}${boardPath}${threadId}.zip`.replace(/\/+/g, "/");
-  await putToR2(key, zipBytes, "application/zip");
+  // ---------- Storage: Internet Archive first, R2 only on IA failure ----------
 
-  return {
-    ok: true,
-    key,
-    assetCount: fetched.length,
-  };
+  const iaResult = await uploadToInternetArchive(boardHost, boardPath, threadId, zipBytes);
+  if (iaResult.ok) {
+    return {
+      ok: true,
+      storage: "ia",
+      key: `${iaResult.identifier}/${iaResult.filename}`,
+      detailsUrl: iaResult.detailsUrl,
+      assetCount: fetched.length,
+    };
+  }
+
+  console.error(
+    `[${boardHost}${boardPath}] IA upload failed for thread ${threadId}, falling back to R2: ${
+      iaResult.reason || `status ${iaResult.status}`
+    }`
+  );
+
+  try {
+    const r2Key = `${boardHost}${boardPath}${threadId}.zip`.replace(/\/+/g, "/");
+    await putToR2(r2Key, zipBytes, "application/zip");
+    return {
+      ok: true,
+      storage: "r2",
+      key: r2Key,
+      assetCount: fetched.length,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: `both IA and R2 upload failed — IA: ${iaResult.reason || iaResult.status}; R2: ${e}`,
+    };
+  }
 }
 
 // ---------- Entry point ----------
@@ -718,7 +903,7 @@ async function main() {
   const payload = readPayload();
   const { threadId, boardHost, boardPath, replies, callbackUrl } = payload;
 
-  let result: { ok: boolean; reason?: string; key?: string; assetCount?: number };
+  let result: ArchiveResult;
   try {
     result = await archiveThread(payload);
   } catch (e) {
@@ -738,14 +923,6 @@ async function main() {
   Deno.exit(result.ok ? 0 : 1);
 }
 
-// FIX: main() was defined but never invoked, so the script loaded, did
-// nothing, and exited 0 — no fetch, no ZIP, no R2 upload, no callback,
-// and no error either, since nothing ever ran to throw one. This is the
-// actual call that kicks everything off. Wrapped in .catch() rather than
-// called bare so that a rejection happening before/outside the internal
-// try/catch (e.g. readPayload() throwing on missing/invalid PAYLOAD_JSON)
-// still gets logged and still exits non-zero, instead of the job
-// potentially reporting a false green run.
 main().catch((e) => {
   console.error(`Unhandled error in main(): ${e}`);
   Deno.exit(1);
