@@ -75,6 +75,44 @@ interface Env {
   IA_ITEM_DESCRIPTION?: string;
 }
 
+// ---------- Logging helpers ----------
+//
+// Plain console.log/error works fine in the Actions log viewer, but a
+// bare JSON dump at the very end makes it hard to tell *where* a run
+// went sideways without expanding the whole step. These helpers add a
+// timestamp + level prefix and get sprinkled through every phase below
+// (discovery, sampling, per-item upload/delete) so a scan of the raw
+// log is enough to see progress and pinpoint failures without waiting
+// for the final summary.
+
+function ts(): string {
+  return new Date().toISOString();
+}
+
+function log(msg: string): void {
+  console.log(`[${ts()}] ${msg}`);
+}
+
+function warn(msg: string): void {
+  console.warn(`[${ts()}] WARN ${msg}`);
+}
+
+function logError(msg: string): void {
+  console.error(`[${ts()}] ERROR ${msg}`);
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let val = n / 1024;
+  let i = 0;
+  while (val >= 1024 && i < units.length - 1) {
+    val /= 1024;
+    i++;
+  }
+  return `${val.toFixed(1)} ${units[i]}`;
+}
+
 function loadEnv(): Env {
   const req = (name: string): string => {
     const v = Deno.env.get(name);
@@ -83,7 +121,7 @@ function loadEnv(): Env {
   };
   const opt = (name: string): string | undefined => Deno.env.get(name) ?? undefined;
 
-  return {
+  const env: Env = {
     R2_ACCOUNT_ID: req("R2_ACCOUNT_ID"),
     R2_ACCESS_KEY_ID: req("R2_ACCESS_KEY_ID"),
     R2_SECRET_ACCESS_KEY: req("R2_SECRET_ACCESS_KEY"),
@@ -98,6 +136,19 @@ function loadEnv(): Env {
     IA_ITEM_TITLE: opt("IA_ITEM_TITLE"),
     IA_ITEM_DESCRIPTION: opt("IA_ITEM_DESCRIPTION"),
   };
+
+  log(
+    `Config loaded — bucket=${env.R2_BUCKET_NAME} account=${env.R2_ACCOUNT_ID} ` +
+      `sampleLimitOverride=${env.SAMPLE_LIMIT ?? "(unset, will default to 45)"} ` +
+      `deleteAfterSync=${env.DELETE_FROM_R2_AFTER_SYNC !== "false"} ` +
+      `iaCredsPresent=${Boolean(env.IA_ACCESS_KEY && env.IA_SECRET_KEY)} ` +
+      `iaIdentifierOverride=${env.IA_IDENTIFIER ?? "(unset, derived per-folder)"}`
+  );
+  if (!env.IA_ACCESS_KEY || !env.IA_SECRET_KEY) {
+    warn("IA_ACCESS_KEY/IA_SECRET_KEY not set — every item this run will fail at upload time.");
+  }
+
+  return env;
 }
 
 // ---------- R2 access via S3-signed requests ----------
@@ -152,22 +203,33 @@ async function listAllObjects(env: Env): Promise<R2ObjectSummary[]> {
   const { client, endpoint } = r2Client(env);
   const all: R2ObjectSummary[] = [];
   let token: string | undefined;
+  let page = 0;
 
+  log(`Listing objects in bucket "${env.R2_BUCKET_NAME}"...`);
   do {
+    page++;
     const url = new URL(`${endpoint}/${env.R2_BUCKET_NAME}`);
     url.searchParams.set("list-type", "2");
     if (token) url.searchParams.set("continuation-token", token);
 
     const res = await client.fetch(url.toString());
     if (!res.ok) {
-      throw new Error(`R2 ListObjectsV2 failed: ${res.status} ${await res.text()}`);
+      const body = await res.text();
+      logError(`R2 ListObjectsV2 failed on page ${page}: ${res.status} ${body.slice(0, 300)}`);
+      throw new Error(`R2 ListObjectsV2 failed: ${res.status} ${body}`);
     }
     const xml = await res.text();
     const parsed = parseListObjectsXml(xml);
     all.push(...parsed.objects);
+    log(
+      `  page ${page}: +${parsed.objects.length} object(s) (running total ${all.length})` +
+        (parsed.isTruncated ? " — more pages remain" : "")
+    );
     token = parsed.isTruncated ? parsed.nextToken : undefined;
   } while (token);
 
+  const totalBytes = all.reduce((sum, o) => sum + o.size, 0);
+  log(`Listing complete — ${all.length} object(s) across ${page} page(s), ${fmtBytes(totalBytes)} total.`);
   return all;
 }
 
@@ -175,8 +237,14 @@ async function getObjectBuffer(env: Env, key: string): Promise<ArrayBuffer | nul
   const { client, endpoint } = r2Client(env);
   const url = `${endpoint}/${env.R2_BUCKET_NAME}/${encodeR2Key(key)}`;
   const res = await client.fetch(url);
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`R2 GetObject failed for ${key}: ${res.status} ${await res.text()}`);
+  if (res.status === 404) {
+    warn(`GetObject 404 for "${key}" — object disappeared between listing and read.`);
+    return null;
+  }
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`R2 GetObject failed for ${key}: ${res.status} ${body}`);
+  }
   return await res.arrayBuffer();
 }
 
@@ -185,8 +253,10 @@ async function deleteObject(env: Env, key: string): Promise<void> {
   const url = `${endpoint}/${env.R2_BUCKET_NAME}/${encodeR2Key(key)}`;
   const res = await client.fetch(url, { method: "DELETE" });
   if (!res.ok && res.status !== 204) {
-    throw new Error(`R2 DeleteObject failed for ${key}: ${res.status} ${await res.text()}`);
+    const body = await res.text();
+    throw new Error(`R2 DeleteObject failed for ${key}: ${res.status} ${body}`);
   }
+  log(`  deleted "${key}" from R2 after successful IA upload.`);
 }
 
 /** Path-encode a key for use in a URL, preserving "/" separators. */
@@ -198,14 +268,37 @@ function encodeR2Key(key: string): string {
 
 function discoverFolders(objects: R2ObjectSummary[]): Map<string, R2ObjectSummary[]> {
   const folders = new Map<string, R2ObjectSummary[]>();
+  let ignoredState = 0;
+  let ignoredRootLevel = 0;
+
   for (const obj of objects) {
-    if (obj.key.startsWith("_state/") || obj.key.includes("/_state/")) continue;
+    if (obj.key.startsWith("_state/") || obj.key.includes("/_state/")) {
+      ignoredState++;
+      continue;
+    }
     const slash = obj.key.lastIndexOf("/");
-    if (slash === -1) continue; // no folder, ignore stray root-level objects
+    if (slash === -1) {
+      ignoredRootLevel++;
+      continue; // no folder, ignore stray root-level objects
+    }
     const folder = obj.key.slice(0, slash + 1);
     if (!folders.has(folder)) folders.set(folder, []);
     folders.get(folder)!.push(obj);
   }
+
+  log(
+    `Discovered ${folders.size} folder(s) from ${objects.length} object(s) ` +
+      `(ignored ${ignoredState} state file(s), ${ignoredRootLevel} root-level stray object(s)).`
+  );
+  const preview = Array.from(folders.entries())
+    .sort((a, b) => b[1].length - a[1].length)
+    .slice(0, 10)
+    .map(([folder, items]) => `${folder} (${items.length})`)
+    .join(", ");
+  if (folders.size > 0) {
+    log(`  top folders by pending count: ${preview}${folders.size > 10 ? ", ..." : ""}`);
+  }
+
   return folders;
 }
 
@@ -266,6 +359,8 @@ async function uploadToInternetArchive(
     env.IA_ITEM_DESCRIPTION ||
     `Archived Futaba Channel threads from ${folder}, each saved as a ZIP (index.html + assets/). Uploaded automatically by the R2-to-IA fallback sync sweep.`;
 
+  log(`  uploading to IA: item="${identifier}" file="${filename}" size=${fmtBytes(buffer.byteLength)}`);
+
   let res: Response;
   try {
     res = await fetch(uploadUrl, {
@@ -286,14 +381,17 @@ async function uploadToInternetArchive(
       body: buffer,
     });
   } catch (e) {
+    logError(`  IA upload request failed for "${filename}": ${e}`);
     return { ok: false, reason: `IA upload request failed: ${e}` };
   }
 
   if (!res.ok) {
     const bodyText = await res.text().catch(() => "");
+    logError(`  IA upload rejected for "${filename}": ${res.status} ${bodyText.slice(0, 300)}`);
     return { ok: false, status: res.status, reason: bodyText.slice(0, 500), identifier, filename };
   }
 
+  log(`  IA upload OK: https://archive.org/details/${identifier} (file: ${filename})`);
   return {
     ok: true,
     status: res.status,
@@ -323,8 +421,10 @@ function sampleRoundRobin(
 
   const selected: { folder: string; obj: R2ObjectSummary }[] = [];
   let madeProgressThisRound = true;
+  let round = 0;
 
   while (selected.length < limit && madeProgressThisRound) {
+    round++;
     madeProgressThisRound = false;
     for (const q of queues) {
       if (selected.length >= limit) break;
@@ -334,6 +434,12 @@ function sampleRoundRobin(
       madeProgressThisRound = true;
     }
   }
+
+  const drainedFolders = queues.filter((q) => q.index >= q.items.length).length;
+  log(
+    `Sampled ${selected.length}/${limit} thread(s) across ${round} round-robin round(s) ` +
+      `(${drainedFolders}/${queues.length} folder(s) fully drained this pass).`
+  );
 
   return selected;
 }
@@ -364,9 +470,16 @@ async function runSampleAndSync(env: Env): Promise<SyncSummary> {
   const folders = discoverFolders(allObjects);
   const selected = sampleRoundRobin(folders, limit);
 
+  if (selected.length === 0) {
+    log("No objects to sync this run.");
+  }
+
   const results: SyncResultEntry[] = [];
+  let processed = 0;
   for (const { folder, obj } of selected) {
+    processed++;
     const threadId = obj.key.split("/").pop()!.replace(/\.(?:mht|zip)$/i, "");
+    log(`[${processed}/${selected.length}] "${obj.key}" (folder=${folder}, ${fmtBytes(obj.size)})`);
     try {
       const buffer = await getObjectBuffer(env, obj.key);
       if (!buffer) {
@@ -378,8 +491,13 @@ async function runSampleAndSync(env: Env): Promise<SyncSummary> {
 
       if (ia.ok && deleteAfterSync) {
         await deleteObject(env, obj.key);
+      } else if (ia.ok && !deleteAfterSync) {
+        log(`  DELETE_FROM_R2_AFTER_SYNC=false — leaving "${obj.key}" in R2.`);
+      } else {
+        warn(`  skipping delete for "${obj.key}" — IA upload did not succeed.`);
       }
     } catch (e) {
+      logError(`  unhandled error processing "${obj.key}": ${e}`);
       results.push({ key: obj.key, ok: false, reason: String(e) });
     }
   }
@@ -400,15 +518,34 @@ async function runSampleAndSync(env: Env): Promise<SyncSummary> {
 // ---------- Entry point ----------
 
 async function main() {
+  const startedAt = Date.now();
+  log("=== Sync R2 fallback -> Internet Archive: starting ===");
+
   const env = loadEnv();
   const summary = await runSampleAndSync(env);
+
+  const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+  log(
+    `=== Sweep finished in ${elapsedSec}s — ` +
+      `${summary.uploaded} uploaded, ${summary.failed} failed, ` +
+      `${summary.sampled} sampled from ${summary.foldersDiscovered} folder(s) (limit=${summary.limit}) ===`
+  );
+
+  if (summary.failed > 0) {
+    log("Failure detail:");
+    for (const r of summary.results.filter((r) => !r.ok)) {
+      logError(`  "${r.key}" (folder=${r.folder ?? "?"}): ${r.reason ?? "unknown error"}`);
+    }
+  }
 
   console.log(JSON.stringify(summary, null, 2));
 
   if (summary.sampled === 0) {
-    console.log("Nothing to sync — R2 fallback bucket is empty (as expected when IA-first uploads are healthy).");
+    log("Nothing to sync — R2 fallback bucket is empty (as expected when IA-first uploads are healthy).");
   } else if (summary.failed > 0) {
-    console.error(`${summary.failed}/${summary.sampled} item(s) failed to sync — see results above.`);
+    logError(`${summary.failed}/${summary.sampled} item(s) failed to sync — see failure detail above.`);
+  } else {
+    log(`All ${summary.uploaded} sampled item(s) synced successfully.`);
   }
 
   // Non-zero exit on any failure so the Actions run itself is visibly red
@@ -417,6 +554,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error(`Unhandled error in main(): ${e}`);
+  logError(`Unhandled error in main(): ${e}`);
   Deno.exit(1);
 });
