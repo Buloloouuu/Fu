@@ -13,7 +13,7 @@ on:
     # Every 6 hours. Adjust to taste — this only matters for however much
     # volume actually falls through to the R2 fallback path, which should
     # be small/rare if IA uploads are healthy.
-    - cron: "0 */6 * * *"
+    - cron: "*/8 * * * *"
   workflow_dispatch:
     inputs:
       sample_limit:
