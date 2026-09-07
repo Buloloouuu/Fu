@@ -14,6 +14,7 @@ Usage:
 import argparse
 import re
 import time
+from datetime import date
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -46,18 +47,51 @@ def infer_link_base(page_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{base_path}"
 
 
-def find_zip_links(page_url: str) -> tuple[list[str], list[str]]:
-    """Fetch a listing page and return (absolute zip URLs, thread IDs)."""
+CUTOFF_DATE = date(2026, 7, 18)  # threads updated on/after this date are skipped (not yet archived)
+
+
+def find_zip_links(page_url: str, cutoff: date = CUTOFF_DATE) -> tuple[list[str], list[str], int]:
+    """
+    Fetch a listing page and return (absolute zip URLs, thread IDs, skipped_count).
+
+    Each table row is scanned individually so the id and its own "update" date
+    stay correctly paired (rather than grabbing all ids and all dates
+    separately, which would misalign them). Rows whose update date is on or
+    after `cutoff` are skipped entirely — those threads are still considered
+    live/recent and shouldn't be archived yet.
+    """
     resp = requests.get(page_url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
     html = resp.text
 
-    ids = re.findall(r'zip\.php\?id=(\d+)', html)
-    ids = sorted(set(ids), key=int, reverse=True)  # dedupe, newest first
-
     link_base = infer_link_base(page_url)
+
+    ids: list[str] = []
+    skipped = 0
+    seen = set()
+
+    # Split on each row start so an id and the date in the same row stay paired.
+    for row in re.split(r"<tr\b", html)[1:]:
+        id_match = re.search(r"zip\.php\?id=(\d+)", row)
+        if not id_match:
+            continue  # no zip available for this thread (still active, etc.)
+        thread_id = id_match.group(1)
+        if thread_id in seen:
+            continue
+
+        date_match = re.search(r"(\d{4})/(\d{2})/(\d{2})\s+\d{2}:\d{2}:\d{2}", row)
+        if date_match:
+            row_date = date(int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3)))
+            if row_date >= cutoff:
+                skipped += 1
+                continue
+
+        seen.add(thread_id)
+        ids.append(thread_id)
+
+    ids = sorted(ids, key=int, reverse=True)
     links = [urljoin(link_base, f"zip.php?id={i}") for i in ids]
-    return links, ids
+    return links, ids, skipped
 
 
 def download(url: str, dest: Path, delay: float) -> None:
@@ -97,13 +131,14 @@ def main():
     for page_url in page_urls:
         print(f"Scanning {page_url}")
         try:
-            links, ids = find_zip_links(page_url)
+            links, ids, skipped = find_zip_links(page_url)
         except requests.RequestException as e:
             print(f"  [fail] could not fetch page: {e}")
             failures += 1
             continue
 
-        print(f"  found {len(links)} zip link(s)")
+        print(f"  found {len(links)} zip link(s) eligible for archiving "
+              f"({skipped} skipped for being updated on/after {CUTOFF_DATE.isoformat()})")
         for zip_url, thread_id in zip(links, ids):
             if thread_id in seen_ids:
                 continue
