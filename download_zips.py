@@ -15,7 +15,7 @@ import argparse
 import re
 import time
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -27,6 +27,25 @@ def page_url_for(base: str, page: int) -> str:
     return base if page == 0 else f"{base.rstrip('/')}/{page}"
 
 
+def infer_link_base(page_url: str) -> str:
+    """
+    tsumanne.net pages declare a <base> tag (base: /si/) that all relative
+    links resolve against — NOT the page's own URL. A page at
+    https://tsumanne.net/si/all/7120 still has its zip links resolve
+    against https://tsumanne.net/si/. This finds that base by cutting the
+    path right before "/all".
+    """
+    parsed = urlparse(page_url)
+    path = parsed.path
+    idx = path.find("/all")
+    if idx != -1:
+        base_path = path[:idx] + "/"
+    else:
+        # Fallback: treat the parent directory of the given path as the base.
+        base_path = path.rsplit("/", 1)[0] + "/"
+    return f"{parsed.scheme}://{parsed.netloc}{base_path}"
+
+
 def find_zip_links(page_url: str) -> tuple[list[str], list[str]]:
     """Fetch a listing page and return (absolute zip URLs, thread IDs)."""
     resp = requests.get(page_url, headers=HEADERS, timeout=30)
@@ -36,7 +55,8 @@ def find_zip_links(page_url: str) -> tuple[list[str], list[str]]:
     ids = re.findall(r'zip\.php\?id=(\d+)', html)
     ids = sorted(set(ids), key=int, reverse=True)  # dedupe, newest first
 
-    links = [urljoin(page_url, f"zip.php?id={i}") for i in ids]
+    link_base = infer_link_base(page_url)
+    links = [urljoin(link_base, f"zip.php?id={i}") for i in ids]
     return links, ids
 
 
