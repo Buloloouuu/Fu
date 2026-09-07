@@ -1,0 +1,93 @@
+name: Download tsumanne zips and archive to IA
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # every hour — adjust to taste
+  workflow_dispatch: {}     # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write   # needed to commit the updated page counter
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests internetarchive
+
+      - name: Read current page number
+        id: page
+        run: |
+          if [ -f state/next_page.txt ]; then
+            PAGE=$(cat state/next_page.txt)
+          else
+            PAGE=7130
+          fi
+          echo "page=$PAGE" >> "$GITHUB_OUTPUT"
+          echo "Current page: $PAGE"
+
+      # Staging step: zips land in downloads/ but are NOT the final destination.
+      # This step fails (non-zero exit) if even one zip on the page fails,
+      # which causes every step below to be skipped automatically.
+      - name: Download page zips to staging folder
+        run: |
+          mkdir -p state downloads
+          python download_zips.py \
+            --base "https://tsumanne.net/si/all" \
+            --pages ${{ steps.page.outputs.page }} ${{ steps.page.outputs.page }} \
+            --out downloads
+
+      # Debug aid only — lets you inspect a partial/failed page's downloads.
+      # Runs even on failure; on success this is redundant with the IA upload below.
+      - name: Upload staging folder as build artifact (debug)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsumanne-zips-page-${{ steps.page.outputs.page }}-partial
+          path: downloads/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # No "if:" needed — this and every step below is skipped automatically
+      # if "Download page zips to staging folder" failed.
+      # Every page's zips accumulate into the SAME IA item (tsumanne-si-archive)
+      # rather than a new item per page — new files just get added to it.
+      - name: Move staged zips to the Internet Archive
+        env:
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+        run: |
+          python upload_to_ia.py \
+            --dir downloads \
+            --identifier "tsumanne-si-archive" \
+            --title "「」ッチー" \
+            --collection opensource_media \
+            --source "https://tsumanne.net/si/"
+
+      - name: Clear staging folder
+        run: rm -rf downloads/*
+
+      - name: Decrement page number and save state
+        run: |
+          NEXT_PAGE=$(( ${{ steps.page.outputs.page }} - 1 ))
+          if [ "$NEXT_PAGE" -lt 0 ]; then
+            NEXT_PAGE=0
+          fi
+          echo "$NEXT_PAGE" > state/next_page.txt
+          echo "Next run will use page: $NEXT_PAGE"
+
+      - name: Commit updated page counter
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/next_page.txt
+          git diff --cached --quiet || git commit -m "Advance to page $(cat state/next_page.txt)"
+          git push
