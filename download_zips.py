@@ -94,6 +94,28 @@ def find_zip_links(page_url: str, cutoff: date = CUTOFF_DATE) -> tuple[list[str]
     return links, ids, skipped
 
 
+def fetch_archived_ids(identifier: str) -> set[str]:
+    """
+    Return the set of thread IDs already present as files in the given
+    Internet Archive item (e.g. https://archive.org/download/tsumanne-si-archive),
+    so we don't re-download or re-upload something already archived.
+
+    If the item doesn't exist yet, IA's metadata API returns an empty
+    files list (not a 404), so a brand-new item just yields an empty set.
+    """
+    url = f"https://archive.org/metadata/{identifier}"
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    ids = set()
+    for f in data.get("files", []):
+        m = re.match(r"^(\d+)\.zip$", f.get("name", ""))
+        if m:
+            ids.add(m.group(1))
+    return ids
+
+
 def download(url: str, dest: Path, delay: float) -> None:
     resp = requests.get(url, headers=HEADERS, timeout=60)
     resp.raise_for_status()
@@ -109,6 +131,11 @@ def main():
                          help="Page range (inclusive) to fetch when using --base, e.g. 0 9")
     parser.add_argument("--out", default="downloads", help="Output directory")
     parser.add_argument("--delay", type=float, default=0.5, help="Seconds to wait between downloads")
+    parser.add_argument("--archive-identifier", default="tsumanne-si-archive",
+                         help="IA item identifier to check for already-archived thread IDs "
+                              "(default: tsumanne-si-archive)")
+    parser.add_argument("--no-archive-check", action="store_true",
+                         help="Skip checking archive.org for already-archived thread IDs")
     args = parser.parse_args()
 
     if not args.page_url and not args.base:
@@ -116,6 +143,18 @@ def main():
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    archived_ids: set[str] = set()
+    if not args.no_archive_check:
+        print(f"Checking already-archived thread IDs in IA item '{args.archive_identifier}'...")
+        try:
+            archived_ids = fetch_archived_ids(args.archive_identifier)
+            print(f"  {len(archived_ids)} thread(s) already archived — these will be skipped.")
+        except requests.RequestException as e:
+            # Fail closed: if we can't confirm what's already archived, don't risk
+            # downloading/uploading duplicates — stop the run instead.
+            print(f"  [fail] could not check archive.org: {e}")
+            raise SystemExit(1)
 
     page_urls = []
     if args.page_url:
@@ -143,6 +182,10 @@ def main():
             if thread_id in seen_ids:
                 continue
             seen_ids.add(thread_id)
+
+            if thread_id in archived_ids:
+                print(f"  [skip] {thread_id}.zip already archived on IA")
+                continue
 
             dest = out_dir / f"{thread_id}.zip"
             if dest.exists():
