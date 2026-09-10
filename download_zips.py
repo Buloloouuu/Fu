@@ -123,6 +123,38 @@ def download(url: str, dest: Path, delay: float) -> None:
     time.sleep(delay)  # be polite, avoid hammering the server
 
 
+def download_with_retry(url: str, dest: Path, delay: float, max_attempts: int = 3) -> None:
+    """
+    Try downloading up to max_attempts times with increasing backoff
+    (2s, 4s, 8s, ...) before giving up. Raises the last exception if every
+    attempt fails, so the caller can decide how to handle a truly-broken zip.
+    """
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            download(url, dest, delay)
+            return
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < max_attempts:
+                backoff = 2 ** attempt
+                print(f"    retry {attempt}/{max_attempts - 1} failed ({e}); waiting {backoff}s...")
+                time.sleep(backoff)
+    raise last_error
+
+
+def load_failed_ids(path: Path) -> set[str]:
+    """Load the persistent set of thread IDs that have been confirmed unrecoverable."""
+    if not path.exists():
+        return set()
+    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+
+
+def save_failed_ids(path: Path, ids: set[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(sorted(ids, key=int)) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("page_url", nargs="?", help="A single listing page URL")
@@ -136,6 +168,9 @@ def main():
                               "(default: tsumanne-si-archive)")
     parser.add_argument("--no-archive-check", action="store_true",
                          help="Skip checking archive.org for already-archived thread IDs")
+    parser.add_argument("--failed-ids-file", default="state/failed_ids.txt",
+                         help="Path to persistent list of thread IDs confirmed unrecoverable "
+                              "after retries (default: state/failed_ids.txt)")
     args = parser.parse_args()
 
     if not args.page_url and not args.base:
@@ -155,6 +190,12 @@ def main():
             # downloading/uploading duplicates — stop the run instead.
             print(f"  [fail] could not check archive.org: {e}")
             raise SystemExit(1)
+
+    failed_ids_path = Path(args.failed_ids_file)
+    known_bad_ids = load_failed_ids(failed_ids_path)
+    if known_bad_ids:
+        print(f"Loaded {len(known_bad_ids)} known-bad thread ID(s) from {failed_ids_path} — these will be skipped.")
+    newly_failed: set[str] = set()
 
     page_urls = []
     if args.page_url:
@@ -187,22 +228,32 @@ def main():
                 print(f"  [skip] {thread_id}.zip already archived on IA")
                 continue
 
+            if thread_id in known_bad_ids:
+                print(f"  [skip] {thread_id}.zip previously confirmed unrecoverable, skipping")
+                continue
+
             dest = out_dir / f"{thread_id}.zip"
             if dest.exists():
                 print(f"  [skip] {dest.name} already exists")
                 continue
             try:
                 print(f"  [get]  {zip_url} -> {dest}")
-                download(zip_url, dest, delay=args.delay)
+                download_with_retry(zip_url, dest, delay=args.delay)
                 total_new += 1
             except requests.RequestException as e:
-                print(f"  [fail] {zip_url}: {e}")
-                failures += 1
+                print(f"  [fail] {zip_url}: {e} — giving up after retries, marking as permanently unrecoverable")
+                newly_failed.add(thread_id)
 
     print(f"Done. Downloaded {total_new} new zip file(s) into {out_dir}/")
 
+    if newly_failed:
+        known_bad_ids |= newly_failed
+        save_failed_ids(failed_ids_path, known_bad_ids)
+        print(f"{len(newly_failed)} thread(s) failed after retries and were added to {failed_ids_path}: "
+              f"{', '.join(sorted(newly_failed, key=int))}")
+
     if failures:
-        print(f"{failures} failure(s) occurred — exiting non-zero so callers know this run was incomplete.")
+        print(f"{failures} page fetch failure(s) occurred — exiting non-zero so callers know this run was incomplete.")
         raise SystemExit(1)
 
 
