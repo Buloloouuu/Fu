@@ -2,7 +2,7 @@ name: Download tsumanne zips and archive to IA
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every hour — adjust to taste
+    - cron: "0 * * * *"   # every hour — adjust to taste
   workflow_dispatch: {}     # lets you trigger it manually from the Actions tab
 
 permissions:
@@ -84,10 +84,13 @@ jobs:
           echo "$NEXT_PAGE" > state/next_page.txt
           echo "Next run will use page: $NEXT_PAGE"
 
-      - name: Commit updated page counter
+      - name: Commit updated state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state/next_page.txt
+          if [ -f state/failed_ids.txt ]; then
+            git add state/failed_ids.txt
+          fi
           git diff --cached --quiet || git commit -m "Advance to page $(cat state/next_page.txt)"
           git push
