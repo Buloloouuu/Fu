@@ -1,13 +1,13 @@
 name: Archive Futaba Thread
-# Triggered by the Cloudflare Worker via GitHub's repository_dispatch API
-# (see cf-worker/index.js, dispatchArchiveBatchViaGitHubActions). ONE event
-# now carries a BATCH of threads under client_payload.threads =
-# [{threadId, replies}, ...] rather than a single thread, so this workflow
-# fans that array back out into one matrix job per thread.
+# Triggered by the Deno service via GitHub's repository_dispatch API
+# (see deno-service/catalog.ts, dispatchArchiveBatchViaGitHubActions). ONE
+# event carries a BATCH of threads under client_payload.threads =
+# [{threadId, replies}, ...], so this workflow fans that array back out
+# into one matrix job per thread.
 #
 # workflow_dispatch is still wired up for manual testing from the Actions
 # tab, and accepts EITHER shape in the `payload` input:
-#   - a full batch payload, same shape as the Worker sends:
+#   - a full batch payload, same shape the Deno service sends:
 #       {"threads":[{"threadId":"...","replies":0}],"boardHost":"...",
 #        "boardPath":"...","userAgent":"...","maxAssetsPerThread":40,
 #        "maxAssetBytes":0,"offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
@@ -20,6 +20,12 @@ name: Archive Futaba Thread
 # The "prepare" job below detects which shape it got and normalizes both
 # into the same {threads, shared} split, so "archive" only ever has to
 # handle one case.
+#
+# STORAGE BACKEND: the "archive" job below uploads each thread's zip to
+# Backblaze B2 (via deno-service/archive-thread.ts, S3-compatible API) —
+# this used to be Cloudflare R2. Only the secret names in the "Archive
+# thread" step's env: block changed (R2_* -> B2_*); nothing else in this
+# workflow is storage-aware.
 on:
   repository_dispatch:
     types: [archive-thread]
@@ -27,9 +33,10 @@ on:
     inputs:
       payload:
         description: >
-          JSON payload — either a full batch (same shape as the Worker's
-          client_payload, with a "threads" array) or a single-thread
-          payload (top-level "threadId"/"replies") for a quick manual test.
+          JSON payload — either a full batch (same shape as the Deno
+          service's client_payload, with a "threads" array) or a
+          single-thread payload (top-level "threadId"/"replies") for a
+          quick manual test.
         required: true
 
 jobs:
@@ -63,7 +70,7 @@ jobs:
           jq empty payload.json
 
           if jq -e 'has("threads")' payload.json > /dev/null; then
-            # Batch shape (from the Worker, or a manually pasted batch).
+            # Batch shape (from the Deno service, or a manually pasted batch).
             jq -c '[.threads[] | {threadId, replies}]' payload.json > threads.json
             jq -c 'del(.threads)' payload.json > shared.json
           else
@@ -116,20 +123,21 @@ jobs:
       - name: Archive thread
         env:
           PAYLOAD_JSON_FILE: payload.json
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_REGION: ${{ secrets.B2_REGION }}
           CALLBACK_SECRET: ${{ secrets.W_SHARED_SECRET }}
         run: |
           export PAYLOAD_JSON="$(cat "$PAYLOAD_JSON_FILE")"
-          # FIX: was "--allow-net --allow-env", which is not enough to
-          # resolve the "npm:aws4fetch" import — Deno needs to write the
-          # downloaded package into its local cache (and read it back),
-          # so it also needs --allow-read/--allow-write (and --allow-sys
-          # for a couple of runtime checks aws4fetch/its deps make). This
-          # was silently swallowing the whole run: the tarball would
-          # download, then the import would throw a permission error
-          # before main() ever got a chance to run. Runner is a fresh,
-          # disposable VM per job, so -A (allow-all) is fine here.
+          # -A (allow-all) is fine here: the runner is a fresh, disposable
+          # VM per job. Needs at least --allow-net (fetch the thread page,
+          # assets, and B2), --allow-env (read the payload/secrets above),
+          # --allow-read/--allow-write (resolve and cache the "npm:aws4fetch"
+          # import), and --allow-sys (a couple of runtime checks aws4fetch's
+          # deps make) — narrower flag sets have previously caused the
+          # npm: import to throw a permission error before main() ever ran,
+          # which silently produced a false-green job (see archive-thread.ts's
+          # own header note on the main() invocation fix for the related
+          # "script loaded but never actually ran" failure mode).
           deno run -A deno-service/archive-thread.ts
