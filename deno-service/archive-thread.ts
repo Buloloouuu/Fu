@@ -7,7 +7,9 @@
  * Cloudflare Worker called with `POST /archive` and awaited synchronously.
  * It's now a one-shot CLI script meant to run inside a GitHub Actions job,
  * triggered per-thread by a `repository_dispatch` event that the Worker
- * sends (see cf-worker/index.js's dispatchArchiveThreadViaGitHubActions).
+ * sends (see cf-worker/index.js's dispatchArchiveBatchViaGitHubActions,
+ * now actually issued from deno-service/catalog.ts — see that file's
+ * header comment).
  *
  * Because GitHub's repository_dispatch API is fire-and-forget (it just
  * confirms the event was accepted, with no way to await a result), this
@@ -16,8 +18,16 @@
  * authenticated with a shared secret. The Worker uses that callback to
  * update its "archived"/"pending" state blobs — see cf-worker/index.js.
  *
+ * STORAGE BACKEND CHANGE: this script's zip upload used to go straight to
+ * Cloudflare R2 via R2's S3-compatible API (Deno has no native R2
+ * binding, so it was already using `aws4fetch` for this — no native
+ * binding to lose). It now uploads to Backblaze B2 instead, over the same
+ * `aws4fetch`-signed S3-compatible flow — just a different endpoint host
+ * and a different set of credential env vars. Nothing about the fetching,
+ * charset handling, asset extraction, or ZIP-building below changed.
+ *
  * Everything else — HTML fetching, offload-uploader resolution, ZIP
- * building, R2 upload — is unchanged from the Deno Deploy version.
+ * building — is unchanged from the Deno Deploy version.
  *
  * INPUT: a single JSON blob in the PAYLOAD_JSON environment variable,
  * shaped like:
@@ -33,14 +43,23 @@
  *     "offloadUploaders": [{ "prefix": "fu", "baseUrl": "..." }],
  *     "callbackUrl": "https://your-worker.workers.dev/thread-complete"
  *   }
- * The Worker builds this payload and sends it as GitHub's `client_payload`;
- * the workflow YAML (.github/workflows/archive-thread.yml) forwards it
- * into PAYLOAD_JSON verbatim via `toJson(github.event.client_payload)`, so
- * this script never needs to parse individual env vars per field.
+ * The Deno service builds this payload per-thread and sends it as
+ * GitHub's `client_payload`; the workflow YAML
+ * (.github/workflows/archive-thread.yml) forwards it into PAYLOAD_JSON
+ * verbatim, so this script never needs to parse individual env vars per
+ * field.
  *
  * Required environment variables (set as GitHub Actions repo/environment
  * secrets, NOT included in the payload):
- *   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
+ *   B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME, B2_REGION
+ *                     — Backblaze B2 Application Key credentials, scoped
+ *                     to the archive bucket, plus the bucket's region
+ *                     (e.g. "us-west-004", taken from its S3 endpoint
+ *                     s3.<region>.backblazeb2.com — do not pass the full
+ *                     endpoint, just the region segment; B2 does not
+ *                     accept "auto" the way R2 did).
+ *                     REMOVED: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
+ *                     R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME.
  *   CALLBACK_SECRET — must match the Worker's W_SHARED_SECRET; sent as
  *                     `Authorization: Bearer ...` on the callback POST.
  */
@@ -177,15 +196,15 @@ function extractStylesheetUrls(html: string) {
 }
 
 /**
- * NOTE ON THE CSS CACHE: the Deno Deploy version cached each board's
- * shared stylesheet in a module-level Map so a warm isolate could skip
- * re-fetching it across several /archive calls in a row. That trick
- * doesn't apply here — each GitHub Actions job is a fresh process (a new
- * VM), so there's no "warm instance" to carry a cache between threads.
- * The stylesheet is simply fetched fresh, once, per job. If this ever
- * becomes worth optimizing, `actions/cache` keyed on board host could
- * persist it across job runs, but for a single small CSS file it isn't
- * worth the added complexity.
+ * NOTE ON THE CSS CACHE: the Deno Deploy HTTP-server version of this
+ * script cached each board's shared stylesheet in a module-level Map so
+ * a warm isolate could skip re-fetching it across several /archive calls
+ * in a row. That trick doesn't apply here — each GitHub Actions job is a
+ * fresh process (a new VM), so there's no "warm instance" to carry a
+ * cache between threads. The stylesheet is simply fetched fresh, once,
+ * per job. If this ever becomes worth optimizing, `actions/cache` keyed
+ * on board host could persist it across job runs, but for a single small
+ * CSS file it isn't worth the added complexity.
  */
 
 // ---------- Offload uploaders (generic — config comes from the payload) ----------
@@ -202,7 +221,7 @@ interface OffloadUploader {
  * uploader's base URL prepended to actually be fetchable. Scans the raw
  * HTML/text for these patterns (not just tag attributes) since they can
  * appear as plain text in a post body too. `uploaders` is whatever list
- * the Worker sent in this request — this function has no built-in
+ * the Deno service sent in this request — this function has no built-in
  * knowledge of which prefixes exist.
  */
 function extractOffloadedAssetUrls(html: string, uploaders: OffloadUploader[]) {
@@ -525,7 +544,14 @@ async function buildZip(entries: ZipEntry[]) {
   return result;
 }
 
-// ---------- R2 upload (S3-compatible API, direct from Deno) ----------
+// ---------- B2 upload (S3-compatible API, direct from Deno) ----------
+//
+// MIGRATION NOTE: this section previously targeted Cloudflare R2
+// (accountId-scoped endpoint, R2_* env vars). It now targets Backblaze
+// B2 instead — same PUT-an-object-over-SigV4 shape, different endpoint
+// host and credential env vars, and a real region string instead of
+// "auto". Nothing about how the ZIP is built or what gets uploaded
+// changed, only getB2Client()/putToB2().
 
 function requireEnv(name: string): string {
   const v = Deno.env.get(name);
@@ -533,28 +559,28 @@ function requireEnv(name: string): string {
   return v;
 }
 
-let r2Client: InstanceType<typeof AwsClient> | null = null;
-function getR2Client() {
-  if (!r2Client) {
-    r2Client = new AwsClient({
-      accessKeyId: requireEnv("R2_ACCESS_KEY_ID"),
-      secretAccessKey: requireEnv("R2_SECRET_ACCESS_KEY"),
+let b2Client: InstanceType<typeof AwsClient> | null = null;
+function getB2Client() {
+  if (!b2Client) {
+    b2Client = new AwsClient({
+      accessKeyId: requireEnv("B2_KEY_ID"),
+      secretAccessKey: requireEnv("B2_APPLICATION_KEY"),
       service: "s3",
-      region: "auto",
+      region: requireEnv("B2_REGION"),
     });
   }
-  return r2Client;
+  return b2Client;
 }
 
-/** PUT an object straight into R2 via its S3-compatible endpoint. */
-async function putToR2(key: string, body: Uint8Array, contentType: string) {
-  const accountId = requireEnv("R2_ACCOUNT_ID");
-  const bucket = requireEnv("R2_BUCKET_NAME");
+/** PUT an object straight into B2 via its S3-compatible endpoint. */
+async function putToB2(key: string, body: Uint8Array, contentType: string) {
+  const region = requireEnv("B2_REGION");
+  const bucket = requireEnv("B2_BUCKET_NAME");
   // Encode each path segment but keep the "/" separators the key relies on.
   const encodedKey = key.split("/").map(encodeURIComponent).join("/");
-  const url = `https://${accountId}.r2.cloudflarestorage.com/${bucket}/${encodedKey}`;
+  const url = `https://s3.${region}.backblazeb2.com/${bucket}/${encodedKey}`;
 
-  const client = getR2Client();
+  const client = getB2Client();
   const res = await client.fetch(url, {
     method: "PUT",
     body,
@@ -563,7 +589,7 @@ async function putToR2(key: string, body: Uint8Array, contentType: string) {
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`R2 PUT failed (${res.status}): ${text.slice(0, 500)}`);
+    throw new Error(`B2 PUT failed (${res.status}): ${text.slice(0, 500)}`);
   }
 }
 
@@ -600,7 +626,7 @@ async function archiveThread(req: ArchiveRequest) {
   const { text: rawHtml } = decodeBuffer(buffer, res.headers.get("content-type"));
 
   // Fetch bare "<prefix>NNNN.ext" mentions too (including ones only in
-  // plain post text), for every uploader the Worker told us about.
+  // plain post text), for every uploader the Deno service told us about.
   const offloadedUrls = extractOffloadedAssetUrls(rawHtml, offloadUploaders);
 
   // Resolve bare filenames appearing in src/href to their real absolute
@@ -654,7 +680,7 @@ async function archiveThread(req: ArchiveRequest) {
   const zipBytes = await buildZip(zipEntries);
 
   const key = `${boardHost}${boardPath}${threadId}.zip`.replace(/\/+/g, "/");
-  await putToR2(key, zipBytes, "application/zip");
+  await putToB2(key, zipBytes, "application/zip");
 
   return {
     ok: true,
@@ -738,14 +764,13 @@ async function main() {
   Deno.exit(result.ok ? 0 : 1);
 }
 
-// FIX: main() was defined but never invoked, so the script loaded, did
-// nothing, and exited 0 — no fetch, no ZIP, no R2 upload, no callback,
-// and no error either, since nothing ever ran to throw one. This is the
-// actual call that kicks everything off. Wrapped in .catch() rather than
-// called bare so that a rejection happening before/outside the internal
-// try/catch (e.g. readPayload() throwing on missing/invalid PAYLOAD_JSON)
-// still gets logged and still exits non-zero, instead of the job
-// potentially reporting a false green run.
+// main() is called (and its rejection handled) below — see the fix note
+// carried over from the previous revision: it must actually be invoked,
+// wrapped in .catch() rather than called bare, so that a rejection
+// happening before/outside the internal try/catch (e.g. readPayload()
+// throwing on missing/invalid PAYLOAD_JSON) still gets logged and still
+// exits non-zero, instead of the job potentially reporting a false green
+// run.
 main().catch((e) => {
   console.error(`Unhandled error in main(): ${e}`);
   Deno.exit(1);
