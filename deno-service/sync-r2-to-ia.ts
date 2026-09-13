@@ -1,21 +1,20 @@
 /**
- * Futaba archiver — R2-to-IA fallback sync sweep (GitHub Actions edition)
+ * Futaba archiver — B2-to-IA fallback sync sweep (GitHub Actions edition)
  *
- * PURPOSE: unchanged from the Deno Deploy version — walk every "folder"
- * that actually exists in the R2 bucket, pull ONE archived thread object
- * from each folder per pass, and keep cycling through folders (1 per
- * folder per round) until either:
+ * PURPOSE: unchanged — walk every "folder" that actually exists in the
+ * B2 bucket, pull ONE archived thread object from each folder per pass,
+ * and keep cycling through folders (1 per folder per round) until either:
  *   - SAMPLE_LIMIT threads total have been collected, or
  *   - every folder has been fully drained
  * whichever comes first. Every thread in the sample is then uploaded to
  * Internet Archive (same IAS3 flow as before), and — if the upload
- * succeeds — deleted from R2.
+ * succeeds — deleted from B2.
  *
  * WHY THIS EXISTS AT ALL, POST IA-FIRST CHANGE:
  * archive-thread.ts now uploads straight to Internet Archive per-thread
- * and only touches R2 when that IA PUT fails (outage, rate limit, bad
+ * and only touches B2 when that IA PUT fails (outage, rate limit, bad
  * creds, oversized item, etc). This script is what drains whatever ends
- * up sitting in R2 because of those fallbacks — it's the safety net, not
+ * up sitting in B2 because of those fallbacks — it's the safety net, not
  * the primary path anymore. Folders are still discovered dynamically
  * (grouping object keys by their directory prefix), so nothing needs to
  * be hardcoded as fallback volume shifts over time.
@@ -31,26 +30,41 @@
  * same convention archive-thread.ts uses so a bad sweep shows red in the
  * Actions UI.
  *
- * R2 access is unchanged: no native R2 binding is available outside
- * Cloudflare Workers, so this talks to the same R2 bucket over R2's
- * S3-compatible API, signing every request with AWS Signature V4 via
- * `aws4fetch` — identical to how archive-thread.ts's R2 fallback path
- * authenticates.
+ * STORAGE BACKEND CHANGE: this script (like archive-thread.ts and
+ * catalog.ts) originally targeted Cloudflare R2 (accountId-scoped
+ * endpoint, R2_* env vars, region "auto"). It now targets Backblaze B2
+ * instead — same shape of S3-compatible API (ListObjectsV2/GetObject/
+ * DeleteObject signed with AWS Signature V4 via `aws4fetch`, since
+ * there's no native binding for either provider outside Cloudflare
+ * Workers), just a different endpoint host
+ * (`s3.<region>.backblazeb2.com` instead of an account-ID-scoped R2
+ * host) and a real region string instead of "auto". Nothing about the
+ * discovery/sampling/upload/delete *logic* below changed, only
+ * b2Client()/b2ObjectUrl() and the env var names.
  *
  * Required environment variables (set as GitHub Actions repo/environment
  * secrets — see .github/workflows/sync-r2-to-ia.yml):
- *   R2_ACCOUNT_ID              - Cloudflare account ID that owns the R2 bucket
- *   R2_ACCESS_KEY_ID           - R2 API token access key ID
- *   R2_SECRET_ACCESS_KEY       - R2 API token secret access key
- *   R2_BUCKET_NAME             - name of the R2 bucket (same bucket archive-thread.ts falls back to)
+ *   B2_KEY_ID              - Backblaze B2 Application Key ID
+ *   B2_APPLICATION_KEY     - Backblaze B2 Application Key secret
+ *   B2_BUCKET_NAME         - name of the B2 bucket (same bucket archive-thread.ts falls back to)
+ *   B2_REGION              - the bucket's region segment, e.g. "us-west-004"
+ *                             (taken from its S3 endpoint
+ *                             s3.<region>.backblazeb2.com — pass the
+ *                             region alone, not the full endpoint; B2
+ *                             does not accept "auto" the way R2 did)
  *   IA_ACCESS_KEY / IA_SECRET_KEY - Internet Archive S3-style keys (required;
  *                                    if missing every item in this run fails)
+ *   REMOVED: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME.
  *
  * Optional:
  *   SAMPLE_LIMIT               - total threads to draw across all folders per
  *                                 run (default 45, matching original behavior)
- *   DELETE_FROM_R2_AFTER_SYNC  - "false" to keep the R2 copy after a
- *                                 successful IA upload (default: delete)
+ *   DELETE_FROM_R2_AFTER_SYNC  - "false" to keep the B2 copy after a
+ *                                 successful IA upload (default: delete).
+ *                                 Env var name kept as-is (not renamed to
+ *                                 DELETE_FROM_B2_AFTER_SYNC) so existing
+ *                                 repo/environment variable configuration
+ *                                 doesn't need to be touched.
  *   IA_IDENTIFIER / IA_COLLECTION / IA_MEDIATYPE / IA_ITEM_TITLE /
  *   IA_ITEM_DESCRIPTION        - same meaning as before / as archive-thread.ts
  *
@@ -60,10 +74,10 @@
 import { AwsClient } from "npm:aws4fetch@1.0.20";
 
 interface Env {
-  R2_ACCOUNT_ID: string;
-  R2_ACCESS_KEY_ID: string;
-  R2_SECRET_ACCESS_KEY: string;
-  R2_BUCKET_NAME: string;
+  B2_KEY_ID: string;
+  B2_APPLICATION_KEY: string;
+  B2_BUCKET_NAME: string;
+  B2_REGION: string;
   SAMPLE_LIMIT?: string;
   DELETE_FROM_R2_AFTER_SYNC?: string;
   IA_ACCESS_KEY?: string;
@@ -122,10 +136,10 @@ function loadEnv(): Env {
   const opt = (name: string): string | undefined => Deno.env.get(name) ?? undefined;
 
   const env: Env = {
-    R2_ACCOUNT_ID: req("R2_ACCOUNT_ID"),
-    R2_ACCESS_KEY_ID: req("R2_ACCESS_KEY_ID"),
-    R2_SECRET_ACCESS_KEY: req("R2_SECRET_ACCESS_KEY"),
-    R2_BUCKET_NAME: req("R2_BUCKET_NAME"),
+    B2_KEY_ID: req("B2_KEY_ID"),
+    B2_APPLICATION_KEY: req("B2_APPLICATION_KEY"),
+    B2_BUCKET_NAME: req("B2_BUCKET_NAME"),
+    B2_REGION: req("B2_REGION"),
     SAMPLE_LIMIT: opt("SAMPLE_LIMIT"),
     DELETE_FROM_R2_AFTER_SYNC: opt("DELETE_FROM_R2_AFTER_SYNC"),
     IA_ACCESS_KEY: opt("IA_ACCESS_KEY"),
@@ -138,7 +152,7 @@ function loadEnv(): Env {
   };
 
   log(
-    `Config loaded — bucket=${env.R2_BUCKET_NAME} account=${env.R2_ACCOUNT_ID} ` +
+    `Config loaded — bucket=${env.B2_BUCKET_NAME} region=${env.B2_REGION} ` +
       `sampleLimitOverride=${env.SAMPLE_LIMIT ?? "(unset, will default to 45)"} ` +
       `deleteAfterSync=${env.DELETE_FROM_R2_AFTER_SYNC !== "false"} ` +
       `iaCredsPresent=${Boolean(env.IA_ACCESS_KEY && env.IA_SECRET_KEY)} ` +
@@ -151,32 +165,32 @@ function loadEnv(): Env {
   return env;
 }
 
-// ---------- R2 access via S3-signed requests ----------
+// ---------- B2 access via S3-signed requests ----------
 
-interface R2ObjectSummary {
+interface B2ObjectSummary {
   key: string;
   size: number;
 }
 
-function r2Client(env: Env): { client: AwsClient; endpoint: string } {
+function b2Client(env: Env): { client: AwsClient; endpoint: string } {
   const client = new AwsClient({
-    accessKeyId: env.R2_ACCESS_KEY_ID,
-    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    accessKeyId: env.B2_KEY_ID,
+    secretAccessKey: env.B2_APPLICATION_KEY,
     service: "s3",
-    region: "auto",
+    region: env.B2_REGION,
   });
-  const endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+  const endpoint = `https://s3.${env.B2_REGION}.backblazeb2.com`;
   return { client, endpoint };
 }
 
 /** Minimal ListObjectsV2 XML parsing — avoids pulling in a full XML parser
  *  for what's a predictable, well-formed AWS response shape. */
 function parseListObjectsXml(xml: string): {
-  objects: R2ObjectSummary[];
+  objects: B2ObjectSummary[];
   isTruncated: boolean;
   nextToken?: string;
 } {
-  const objects: R2ObjectSummary[] = [];
+  const objects: B2ObjectSummary[] = [];
   const contentsRe = /<Contents>([\s\S]*?)<\/Contents>/g;
   let m: RegExpExecArray | null;
   while ((m = contentsRe.exec(xml))) {
@@ -199,24 +213,24 @@ function decodeXmlEntities(s: string): string {
     .replace(/&apos;/g, "'");
 }
 
-async function listAllObjects(env: Env): Promise<R2ObjectSummary[]> {
-  const { client, endpoint } = r2Client(env);
-  const all: R2ObjectSummary[] = [];
+async function listAllObjects(env: Env): Promise<B2ObjectSummary[]> {
+  const { client, endpoint } = b2Client(env);
+  const all: B2ObjectSummary[] = [];
   let token: string | undefined;
   let page = 0;
 
-  log(`Listing objects in bucket "${env.R2_BUCKET_NAME}"...`);
+  log(`Listing objects in bucket "${env.B2_BUCKET_NAME}"...`);
   do {
     page++;
-    const url = new URL(`${endpoint}/${env.R2_BUCKET_NAME}`);
+    const url = new URL(`${endpoint}/${env.B2_BUCKET_NAME}`);
     url.searchParams.set("list-type", "2");
     if (token) url.searchParams.set("continuation-token", token);
 
     const res = await client.fetch(url.toString());
     if (!res.ok) {
       const body = await res.text();
-      logError(`R2 ListObjectsV2 failed on page ${page}: ${res.status} ${body.slice(0, 300)}`);
-      throw new Error(`R2 ListObjectsV2 failed: ${res.status} ${body}`);
+      logError(`B2 ListObjectsV2 failed on page ${page}: ${res.status} ${body.slice(0, 300)}`);
+      throw new Error(`B2 ListObjectsV2 failed: ${res.status} ${body}`);
     }
     const xml = await res.text();
     const parsed = parseListObjectsXml(xml);
@@ -234,8 +248,8 @@ async function listAllObjects(env: Env): Promise<R2ObjectSummary[]> {
 }
 
 async function getObjectBuffer(env: Env, key: string): Promise<ArrayBuffer | null> {
-  const { client, endpoint } = r2Client(env);
-  const url = `${endpoint}/${env.R2_BUCKET_NAME}/${encodeR2Key(key)}`;
+  const { client, endpoint } = b2Client(env);
+  const url = `${endpoint}/${env.B2_BUCKET_NAME}/${encodeB2Key(key)}`;
   const res = await client.fetch(url);
   if (res.status === 404) {
     warn(`GetObject 404 for "${key}" — object disappeared between listing and read.`);
@@ -243,31 +257,31 @@ async function getObjectBuffer(env: Env, key: string): Promise<ArrayBuffer | nul
   }
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`R2 GetObject failed for ${key}: ${res.status} ${body}`);
+    throw new Error(`B2 GetObject failed for ${key}: ${res.status} ${body}`);
   }
   return await res.arrayBuffer();
 }
 
 async function deleteObject(env: Env, key: string): Promise<void> {
-  const { client, endpoint } = r2Client(env);
-  const url = `${endpoint}/${env.R2_BUCKET_NAME}/${encodeR2Key(key)}`;
+  const { client, endpoint } = b2Client(env);
+  const url = `${endpoint}/${env.B2_BUCKET_NAME}/${encodeB2Key(key)}`;
   const res = await client.fetch(url, { method: "DELETE" });
   if (!res.ok && res.status !== 204) {
     const body = await res.text();
-    throw new Error(`R2 DeleteObject failed for ${key}: ${res.status} ${body}`);
+    throw new Error(`B2 DeleteObject failed for ${key}: ${res.status} ${body}`);
   }
-  log(`  deleted "${key}" from R2 after successful IA upload.`);
+  log(`  deleted "${key}" from B2 after successful IA upload.`);
 }
 
 /** Path-encode a key for use in a URL, preserving "/" separators. */
-function encodeR2Key(key: string): string {
+function encodeB2Key(key: string): string {
   return key.split("/").map(encodeURIComponent).join("/");
 }
 
 // ---------- Folder discovery (replaces hardcoded board config) ----------
 
-function discoverFolders(objects: R2ObjectSummary[]): Map<string, R2ObjectSummary[]> {
-  const folders = new Map<string, R2ObjectSummary[]>();
+function discoverFolders(objects: B2ObjectSummary[]): Map<string, B2ObjectSummary[]> {
+  const folders = new Map<string, B2ObjectSummary[]>();
   let ignoredState = 0;
   let ignoredRootLevel = 0;
 
@@ -357,7 +371,7 @@ async function uploadToInternetArchive(
   const title = env.IA_ITEM_TITLE || `Futaba thread archive (${folder})`;
   const description =
     env.IA_ITEM_DESCRIPTION ||
-    `Archived Futaba Channel threads from ${folder}, each saved as a ZIP (index.html + assets/). Uploaded automatically by the R2-to-IA fallback sync sweep.`;
+    `Archived Futaba Channel threads from ${folder}, each saved as a ZIP (index.html + assets/). Uploaded automatically by the B2-to-IA fallback sync sweep.`;
 
   log(`  uploading to IA: item="${identifier}" file="${filename}" size=${fmtBytes(buffer.byteLength)}`);
 
@@ -405,21 +419,21 @@ async function uploadToInternetArchive(
 
 interface Queue {
   folder: string;
-  items: R2ObjectSummary[];
+  items: B2ObjectSummary[];
   index: number;
 }
 
 function sampleRoundRobin(
-  folders: Map<string, R2ObjectSummary[]>,
+  folders: Map<string, B2ObjectSummary[]>,
   limit: number
-): { folder: string; obj: R2ObjectSummary }[] {
+): { folder: string; obj: B2ObjectSummary }[] {
   const queues: Queue[] = Array.from(folders.entries()).map(([folder, items]) => ({
     folder,
     items,
     index: 0,
   }));
 
-  const selected: { folder: string; obj: R2ObjectSummary }[] = [];
+  const selected: { folder: string; obj: B2ObjectSummary }[] = [];
   let madeProgressThisRound = true;
   let round = 0;
 
@@ -492,7 +506,7 @@ async function runSampleAndSync(env: Env): Promise<SyncSummary> {
       if (ia.ok && deleteAfterSync) {
         await deleteObject(env, obj.key);
       } else if (ia.ok && !deleteAfterSync) {
-        log(`  DELETE_FROM_R2_AFTER_SYNC=false — leaving "${obj.key}" in R2.`);
+        log(`  DELETE_FROM_R2_AFTER_SYNC=false — leaving "${obj.key}" in B2.`);
       } else {
         warn(`  skipping delete for "${obj.key}" — IA upload did not succeed.`);
       }
@@ -519,7 +533,7 @@ async function runSampleAndSync(env: Env): Promise<SyncSummary> {
 
 async function main() {
   const startedAt = Date.now();
-  log("=== Sync R2 fallback -> Internet Archive: starting ===");
+  log("=== Sync B2 fallback -> Internet Archive: starting ===");
 
   const env = loadEnv();
   const summary = await runSampleAndSync(env);
@@ -541,7 +555,7 @@ async function main() {
   console.log(JSON.stringify(summary, null, 2));
 
   if (summary.sampled === 0) {
-    log("Nothing to sync — R2 fallback bucket is empty (as expected when IA-first uploads are healthy).");
+    log("Nothing to sync — B2 fallback bucket is empty (as expected when IA-first uploads are healthy).");
   } else if (summary.failed > 0) {
     logError(`${summary.failed}/${summary.sampled} item(s) failed to sync — see failure detail above.`);
   } else {
