@@ -1,17 +1,25 @@
 name: Sync R2 Fallback to Internet Archive
 # Drains whatever archive-thread.ts couldn't push straight to Internet
-# Archive (see deno-service/archive-thread.ts's IA-first-with-R2-fallback
+# Archive (see deno-service/archive-thread.ts's IA-first-with-B2-fallback
 # storage logic). Under normal operation this bucket should stay near-
 # empty; this workflow exists to catch and retry the cases where an IA
 # PUT failed at archive time (outage, rate limit, bad creds, oversized
-# item, etc) and the zip landed in R2 instead.
+# item, etc) and the zip landed in B2 instead.
+#
+# STORAGE BACKEND: same as archive-thread.yml — this used to target
+# Cloudflare R2 (R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY/
+# R2_BUCKET_NAME). Only the secret names in the "Sync R2 fallback objects
+# to Internet Archive" step's env: block changed (R2_* -> B2_*, plus a
+# new B2_REGION); nothing else in this workflow is storage-aware. The
+# workflow's own name/comments still say "R2" as a legacy label for this
+# fallback-sync job — rename if you want it to read "B2" everywhere too.
 #
 # Runs on a schedule and can also be triggered manually from the Actions
 # tab (with an optional one-off SAMPLE_LIMIT override for that run).
 on:
   schedule:
     # Every 6 hours. Adjust to taste — this only matters for however much
-    # volume actually falls through to the R2 fallback path, which should
+    # volume actually falls through to the B2 fallback path, which should
     # be small/rare if IA uploads are healthy.
     - cron: "*/45 * * * *"
   workflow_dispatch:
@@ -37,12 +45,12 @@ jobs:
         uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - name: Sync R2 fallback objects to Internet Archive
+      - name: Sync B2 fallback objects to Internet Archive
         env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_REGION: ${{ secrets.B2_REGION }}
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
           IA_IDENTIFIER: ${{ secrets.IA_IDENTIFIER }}
