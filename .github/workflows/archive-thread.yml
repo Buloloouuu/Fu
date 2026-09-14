@@ -1,31 +1,36 @@
 name: Archive Futaba Thread
-# Triggered by the Deno service via GitHub's repository_dispatch API
-# (see deno-service/catalog.ts, dispatchArchiveBatchViaGitHubActions). ONE
-# event carries a BATCH of threads under client_payload.threads =
-# [{threadId, replies}, ...], so this workflow fans that array back out
-# into one matrix job per thread.
+# Triggered by the Deno Deploy service via GitHub's repository_dispatch
+# API (see deno-service/catalog.ts's dispatchArchiveBatchViaGitHubActions
+# — this used to be sent by a Cloudflare Worker; Cloudflare has been
+# dropped from this project entirely, the Deno service now owns
+# scheduling AND dispatch on its own). ONE event carries a BATCH of
+# threads under client_payload.threads = [{threadId, replies}, ...], so
+# this workflow fans that array back out into one matrix job per thread.
 #
 # workflow_dispatch is still wired up for manual testing from the Actions
 # tab, and accepts EITHER shape in the `payload` input:
-#   - a full batch payload, same shape the Deno service sends:
+#   - a full batch payload, same shape as the Deno service sends:
 #       {"threads":[{"threadId":"...","replies":0}],"boardHost":"...",
 #        "boardPath":"...","userAgent":"...","maxAssetsPerThread":40,
 #        "maxAssetBytes":0,"offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
-#        "callbackUrl":"https://your-worker.workers.dev/thread-complete"}
+#        "callbackUrl":"https://your-deno-service.deno.dev/thread-complete"}
 #   - or the older single-thread shape, for a quick one-off test:
 #       {"threadId":"...","boardHost":"...","boardPath":"...","replies":0,
 #        "userAgent":"...","maxAssetsPerThread":40,"maxAssetBytes":0,
 #        "offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
-#        "callbackUrl":"https://your-worker.workers.dev/thread-complete"}
+#        "callbackUrl":"https://your-deno-service.deno.dev/thread-complete"}
 # The "prepare" job below detects which shape it got and normalizes both
 # into the same {threads, shared} split, so "archive" only ever has to
 # handle one case.
 #
-# STORAGE BACKEND: the "archive" job below uploads each thread's zip to
-# Backblaze B2 (via deno-service/archive-thread.ts, S3-compatible API) —
-# this used to be Cloudflare R2. Only the secret names in the "Archive
-# thread" step's env: block changed (R2_* -> B2_*); nothing else in this
-# workflow is storage-aware.
+# ARCHITECTURE CHANGE (R2 -> GitHub Releases):
+# archive-thread.ts no longer uploads the finished ZIP to Cloudflare R2.
+# It now creates/reuses a GitHub Release (tagged with the board's slug)
+# and uploads the ZIP as a release asset, using this job's own
+# auto-issued GITHUB_TOKEN — NOT a manually created secret. That token
+# needs `contents: write` permission on this job (set below) to be
+# allowed to create releases and upload assets; without it, every
+# archive job will fail at the upload step with a 403.
 on:
   repository_dispatch:
     types: [archive-thread]
@@ -38,6 +43,9 @@ on:
           single-thread payload (top-level "threadId"/"replies") for a
           quick manual test.
         required: true
+
+permissions:
+  contents: write   # required so GITHUB_TOKEN can create releases / upload release assets
 
 jobs:
   # Normalizes both trigger types / both payload shapes into:
@@ -111,8 +119,7 @@ jobs:
           deno-version: v2.x
       # Merges this matrix entry's {threadId, replies} back into the
       # shared fields from "prepare", producing exactly the same
-      # single-thread PAYLOAD_JSON shape archive-thread.ts already expects
-      # — that script needed no changes for batching.
+      # single-thread PAYLOAD_JSON shape archive-thread.ts already expects.
       - name: Build payload for this thread
         run: |
           echo '${{ needs.prepare.outputs.shared }}' | jq \
@@ -123,21 +130,22 @@ jobs:
       - name: Archive thread
         env:
           PAYLOAD_JSON_FILE: payload.json
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
-          B2_REGION: ${{ secrets.B2_REGION }}
-          CALLBACK_SECRET: ${{ secrets.W_SHARED_SECRET }}
+          # Auto-issued per-job token, NOT a manually created secret.
+          # Scoped by the `permissions: contents: write` block above —
+          # this is what lets archive-thread.ts create the board's
+          # Release (if it doesn't exist yet) and upload the ZIP as a
+          # release asset. Was R2_ACCOUNT_ID / R2_ACCESS_KEY_ID /
+          # R2_SECRET_ACCESS_KEY / R2_BUCKET_NAME before Cloudflare was
+          # dropped — none of those are needed anymore.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Must match the Deno service's own CALLBACK_SECRET — used to
+          # authenticate the POST to the Deno service's /thread-complete
+          # endpoint once this job finishes.
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           export PAYLOAD_JSON="$(cat "$PAYLOAD_JSON_FILE")"
-          # -A (allow-all) is fine here: the runner is a fresh, disposable
-          # VM per job. Needs at least --allow-net (fetch the thread page,
-          # assets, and B2), --allow-env (read the payload/secrets above),
-          # --allow-read/--allow-write (resolve and cache the "npm:aws4fetch"
-          # import), and --allow-sys (a couple of runtime checks aws4fetch's
-          # deps make) — narrower flag sets have previously caused the
-          # npm: import to throw a permission error before main() ever ran,
-          # which silently produced a false-green job (see archive-thread.ts's
-          # own header note on the main() invocation fix for the related
-          # "script loaded but never actually ran" failure mode).
+          # -A (allow-all): this runner is a fresh, disposable VM per job,
+          # so there's no reason to hand-pick permissions — Deno needs
+          # net (fetch), env (reading PAYLOAD_JSON/GITHUB_TOKEN/etc), and
+          # read/write (module cache for any npm: imports) at minimum.
           deno run -A deno-service/archive-thread.ts
