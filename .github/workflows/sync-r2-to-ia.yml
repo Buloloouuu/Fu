@@ -1,42 +1,53 @@
-name: Sync R2 Fallback to Internet Archive
-# Drains whatever archive-thread.ts couldn't push straight to Internet
-# Archive (see deno-service/archive-thread.ts's IA-first-with-B2-fallback
-# storage logic). Under normal operation this bucket should stay near-
-# empty; this workflow exists to catch and retry the cases where an IA
-# PUT failed at archive time (outage, rate limit, bad creds, oversized
-# item, etc) and the zip landed in B2 instead.
+name: Sync GitHub Releases Fallback to Internet Archive
+# Drains whatever's currently sitting in this repo's Release assets (see
+# deno-service/archive-thread.ts's storage step) into Internet Archive.
+# Under normal operation this can hold quite a bit of volume — unlike a
+# true IA-first-with-fallback design, archive-thread.ts always lands the
+# ZIP in a Release asset first; this sweep (and/or catalog.ts's own
+# /sync-ia, on its own schedule) is what drains it into IA afterward.
 #
-# STORAGE BACKEND: same as archive-thread.yml — this used to target
-# Cloudflare R2 (R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY/
-# R2_BUCKET_NAME). Only the secret names in the "Sync R2 fallback objects
-# to Internet Archive" step's env: block changed (R2_* -> B2_*, plus a
-# new B2_REGION); nothing else in this workflow is storage-aware. The
-# workflow's own name/comments still say "R2" as a legacy label for this
-# fallback-sync job — rename if you want it to read "B2" everywhere too.
+# STORAGE BACKEND: this used to target Backblaze B2 (B2_KEY_ID/
+# B2_APPLICATION_KEY/B2_BUCKET_NAME/B2_REGION), and before that
+# Cloudflare R2. Both are gone — this project no longer uses any
+# S3-compatible object store at all. "Folders" are now GitHub Releases
+# (one per board, tagged with that board's slug) and "objects" are that
+# release's assets. Auth is a plain GitHub bearer token instead of an
+# AWS-signature-v4-signed request, so there's no separate storage
+# provider account to manage — just this repo's own permissions.
+#
+# OVERLAP NOTE: deno-service/catalog.ts's own GET /sync-ia (optionally on
+# a SYNC_CRON schedule on the Deno service) already does this same job.
+# Running both this workflow and that schedule is safe (a double-delete
+# on an already-synced asset just 404s, which both tolerate), but if you
+# don't need this workflow's fair round-robin-across-boards sampling on
+# top of what the Deno service already does, you can delete this
+# workflow and companion script entirely and rely on /sync-ia alone.
 #
 # Runs on a schedule and can also be triggered manually from the Actions
 # tab (with an optional one-off SAMPLE_LIMIT override for that run).
 on:
   schedule:
-    # Every 6 hours. Adjust to taste — this only matters for however much
-    # volume actually falls through to the B2 fallback path, which should
-    # be small/rare if IA uploads are healthy.
+    # Every 20 minutes. Adjust to taste based on how much volume actually
+    # accumulates in Release assets between sweeps.
     - cron: "*/20 * * * *"
   workflow_dispatch:
     inputs:
       sample_limit:
         description: >
           Override SAMPLE_LIMIT for this run only (total threads to sync
-          across all folders, round-robin). Leave blank to use the
-          repo/environment secret default (45 if that's also unset).
+          across all releases, round-robin). Leave blank to use the
+          repo/environment variable default (45 if that's also unset).
         required: false
+
+permissions:
+  contents: write   # needed to delete a Release asset after a successful IA upload
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # Bucket listing + up to SAMPLE_LIMIT sequential IA uploads/deletes —
-    # generous but bounded, same reasoning as archive-thread.yml's job
-    # timeout.
+    # Release/asset listing + up to SAMPLE_LIMIT sequential IA
+    # uploads/deletes — generous but bounded, same reasoning as
+    # archive-thread.yml's job timeout.
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -45,12 +56,16 @@ jobs:
         uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - name: Sync B2 fallback objects to Internet Archive
+      - name: Sync Release-asset fallback objects to Internet Archive
         env:
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
-          B2_REGION: ${{ secrets.B2_REGION }}
+          # Auto-issued per-job token, NOT a manually created secret —
+          # scoped by the `permissions: contents: write` block above.
+          # Replaces B2_KEY_ID/B2_APPLICATION_KEY/B2_BUCKET_NAME/
+          # B2_REGION entirely; no separate storage-provider secret is
+          # needed anymore.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
           IA_IDENTIFIER: ${{ secrets.IA_IDENTIFIER }}
@@ -58,15 +73,18 @@ jobs:
           IA_MEDIATYPE: ${{ secrets.IA_MEDIATYPE }}
           IA_ITEM_TITLE: ${{ secrets.IA_ITEM_TITLE }}
           IA_ITEM_DESCRIPTION: ${{ secrets.IA_ITEM_DESCRIPTION }}
+          # Env var name kept as-is (not renamed to e.g.
+          # DELETE_FROM_RELEASES_AFTER_SYNC) for continuity with
+          # catalog.ts's own IA sync, which keeps the same name for the
+          # same reason.
           DELETE_FROM_R2_AFTER_SYNC: ${{ vars.DELETE_FROM_R2_AFTER_SYNC }}
           # workflow_dispatch input wins when provided; otherwise fall
           # back to the repo/environment variable, then the script's own
           # default of 45.
           SAMPLE_LIMIT: ${{ github.event.inputs.sample_limit || vars.SAMPLE_LIMIT }}
         run: |
-          # -A (allow-all): same reasoning as archive-thread.yml — this is
-          # a fresh, disposable Actions runner per job, and the
-          # "npm:aws4fetch" import needs read/write access to Deno's local
-          # module cache (plus a couple of --allow-sys runtime checks),
-          # not just --allow-net/--allow-env.
-          deno run -A deno-service/sync-r2-to-ia.ts
+          # -A (allow-all): fresh, disposable Actions runner per job, no
+          # need to hand-pick permissions. No npm: imports anymore (the
+          # aws4fetch dependency was only needed for S3-signed requests),
+          # so this is now a plain Deno script with no external deps.
+          deno run -A deno-service/sync-releases-to-ia.ts
