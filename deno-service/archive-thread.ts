@@ -1,33 +1,35 @@
 /**
  * Futaba Channel thread archiver — GitHub Actions half.
  *
- * ARCHITECTURE CHANGE FROM THE DENO DEPLOY VERSION:
+ * ARCHITECTURE CHANGE (R2 -> GitHub Releases):
  *
- * This used to be a `Deno.serve` HTTP server on Deno Deploy that the
- * Cloudflare Worker called with `POST /archive` and awaited synchronously.
- * It's now a one-shot CLI script meant to run inside a GitHub Actions job,
- * triggered per-thread by a `repository_dispatch` event that the Worker
- * sends (see cf-worker/index.js's dispatchArchiveBatchViaGitHubActions,
- * now actually issued from deno-service/catalog.ts — see that file's
- * header comment).
+ * This used to upload the finished ZIP straight into Cloudflare R2 via
+ * R2's S3-compatible API (aws4fetch). Cloudflare (Worker + R2) has been
+ * dropped from this project entirely. The ZIP now goes to a GitHub
+ * Release asset instead:
+ *   - one Release per board, tagged with that board's slug
+ *     (boardSlug(host, path)), created on first use
+ *   - one asset per thread inside that release, named "<threadId>.zip"
+ *   - re-archiving a thread (more replies than last time) deletes the
+ *     old same-named asset first, since GitHub's upload API rejects a
+ *     duplicate asset name on a release rather than overwriting it —
+ *     unlike R2's PUT-by-key, which just silently replaced the object.
  *
- * Because GitHub's repository_dispatch API is fire-and-forget (it just
- * confirms the event was accepted, with no way to await a result), this
+ * This still runs as a one-shot CLI script inside a GitHub Actions job,
+ * triggered per-batch by a `repository_dispatch` event that the Deno
+ * service sends (see deno-service/catalog.ts's
+ * dispatchArchiveBatchViaGitHubActions, and .github/workflows/
+ * archive-thread.yml, which fans a batch back out into one matrix job
+ * per thread).
+ *
+ * Because GitHub's repository_dispatch API is fire-and-forget, this
  * script reports back over HTTP itself once it's done: it POSTs a small
- * JSON result to a callback URL (the Worker's /thread-complete endpoint),
- * authenticated with a shared secret. The Worker uses that callback to
- * update its "archived"/"pending" state blobs — see cf-worker/index.js.
- *
- * STORAGE BACKEND CHANGE: this script's zip upload used to go straight to
- * Cloudflare R2 via R2's S3-compatible API (Deno has no native R2
- * binding, so it was already using `aws4fetch` for this — no native
- * binding to lose). It now uploads to Backblaze B2 instead, over the same
- * `aws4fetch`-signed S3-compatible flow — just a different endpoint host
- * and a different set of credential env vars. Nothing about the fetching,
- * charset handling, asset extraction, or ZIP-building below changed.
- *
- * Everything else — HTML fetching, offload-uploader resolution, ZIP
- * building — is unchanged from the Deno Deploy version.
+ * JSON result to a callback URL (the Deno service's own
+ * /thread-complete endpoint — see deno-service/catalog.ts), authenticated
+ * with a shared secret. The Deno service uses that callback to update
+ * its "archived"/"pending" state, which now also lives in this repo
+ * (see deno-service/catalog.ts's GitHub-backed state helpers) rather
+ * than in R2.
  *
  * INPUT: a single JSON blob in the PAYLOAD_JSON environment variable,
  * shaped like:
@@ -36,35 +38,32 @@
  *     "boardHost": "may.2chan.net",
  *     "boardPath": "/b/",
  *     "replies": 42,                  // echoed back in the callback so the
- *                                     // Worker can record the right count
+ *                                     // Deno service can record the right count
  *     "userAgent": "...",             // optional
  *     "maxAssetsPerThread": 40,       // optional
  *     "maxAssetBytes": 0,             // optional
  *     "offloadUploaders": [{ "prefix": "fu", "baseUrl": "..." }],
- *     "callbackUrl": "https://your-worker.workers.dev/thread-complete"
+ *     "callbackUrl": "https://your-deno-service.deno.dev/thread-complete"
  *   }
- * The Deno service builds this payload per-thread and sends it as
- * GitHub's `client_payload`; the workflow YAML
+ * The Deno service builds this payload and sends it as GitHub's
+ * `client_payload`; the workflow YAML
  * (.github/workflows/archive-thread.yml) forwards it into PAYLOAD_JSON
- * verbatim, so this script never needs to parse individual env vars per
- * field.
+ * verbatim via `toJson(github.event.client_payload)`, so this script
+ * never needs to parse individual env vars per field.
  *
- * Required environment variables (set as GitHub Actions repo/environment
- * secrets, NOT included in the payload):
- *   B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME, B2_REGION
- *                     — Backblaze B2 Application Key credentials, scoped
- *                     to the archive bucket, plus the bucket's region
- *                     (e.g. "us-west-004", taken from its S3 endpoint
- *                     s3.<region>.backblazeb2.com — do not pass the full
- *                     endpoint, just the region segment; B2 does not
- *                     accept "auto" the way R2 did).
- *                     REMOVED: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
- *                     R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME.
- *   CALLBACK_SECRET — must match the Worker's W_SHARED_SECRET; sent as
- *                     `Authorization: Bearer ...` on the callback POST.
+ * Required environment variables:
+ *   GITHUB_TOKEN     — the job's auto-issued per-run token
+ *                      (${{ secrets.GITHUB_TOKEN }} in the workflow YAML,
+ *                      NOT a manually created PAT). Needs
+ *                      `permissions: contents: write` set on the job so
+ *                      it's allowed to create releases and upload assets.
+ *   GITHUB_REPOSITORY — set automatically by every GitHub Actions
+ *                      runner as "owner/repo"; not something you need to
+ *                      pass in yourself.
+ *   CALLBACK_SECRET   — must match the Deno service's CALLBACK_SECRET;
+ *                      sent as `Authorization: Bearer ...` on the
+ *                      callback POST.
  */
-
-import { AwsClient } from "npm:aws4fetch@1.0.20";
 
 // ---------- Charset handling ----------
 
@@ -196,15 +195,15 @@ function extractStylesheetUrls(html: string) {
 }
 
 /**
- * NOTE ON THE CSS CACHE: the Deno Deploy HTTP-server version of this
- * script cached each board's shared stylesheet in a module-level Map so
- * a warm isolate could skip re-fetching it across several /archive calls
- * in a row. That trick doesn't apply here — each GitHub Actions job is a
- * fresh process (a new VM), so there's no "warm instance" to carry a
- * cache between threads. The stylesheet is simply fetched fresh, once,
- * per job. If this ever becomes worth optimizing, `actions/cache` keyed
- * on board host could persist it across job runs, but for a single small
- * CSS file it isn't worth the added complexity.
+ * NOTE ON THE CSS CACHE: an earlier Deno Deploy version cached each
+ * board's shared stylesheet in a module-level Map so a warm isolate
+ * could skip re-fetching it across several calls in a row. That trick
+ * doesn't apply here — each GitHub Actions job is a fresh process (a new
+ * VM), so there's no "warm instance" to carry a cache between threads.
+ * The stylesheet is simply fetched fresh, once, per job. If this ever
+ * becomes worth optimizing, `actions/cache` keyed on board host could
+ * persist it across job runs, but for a single small CSS file it isn't
+ * worth the added complexity.
  */
 
 // ---------- Offload uploaders (generic — config comes from the payload) ----------
@@ -386,9 +385,8 @@ const CRC_TABLE = (() => {
 // "Slicing-by-8": precompute 7 more tables so the main loop consumes 8
 // bytes per iteration instead of 1. GitHub Actions runners give a full
 // 2-core VM per job with no CPU-time metering, so this is even less of a
-// concern than it was on Deno Deploy — kept as-is since it's still cheap
-// insurance on large multi-MB video buffers and there's no reason to rip
-// it out.
+// concern than on a serverless platform — kept as-is since it's still
+// cheap insurance on large multi-MB video buffers.
 const CRC_TABLES = (() => {
   const tables = [CRC_TABLE];
   for (let t = 1; t < 8; t++) {
@@ -544,14 +542,20 @@ async function buildZip(entries: ZipEntry[]) {
   return result;
 }
 
-// ---------- B2 upload (S3-compatible API, direct from Deno) ----------
+// ---------- GitHub Releases upload (replaces R2) ----------
 //
-// MIGRATION NOTE: this section previously targeted Cloudflare R2
-// (accountId-scoped endpoint, R2_* env vars). It now targets Backblaze
-// B2 instead — same PUT-an-object-over-SigV4 shape, different endpoint
-// host and credential env vars, and a real region string instead of
-// "auto". Nothing about how the ZIP is built or what gets uploaded
-// changed, only getB2Client()/putToB2().
+// Runs inside the GitHub Actions job itself, so it uses the job's
+// auto-issued token (GITHUB_TOKEN — set as an env var by the workflow
+// YAML from ${{ secrets.GITHUB_TOKEN }}, NOT a manually created PAT)
+// rather than a personal access token. The workflow needs
+// `permissions: contents: write` for this token to be allowed to create
+// releases / upload assets.
+//
+// One release per board (tag = boardSlug), one asset per thread
+// (<threadId>.zip). Re-archiving a thread with more replies means
+// deleting the old asset first — GitHub rejects uploading an asset name
+// that already exists on a release rather than overwriting it, unlike
+// R2's PUT-by-key which just silently replaced the object.
 
 function requireEnv(name: string): string {
   const v = Deno.env.get(name);
@@ -559,41 +563,117 @@ function requireEnv(name: string): string {
   return v;
 }
 
-let b2Client: InstanceType<typeof AwsClient> | null = null;
-function getB2Client() {
-  if (!b2Client) {
-    b2Client = new AwsClient({
-      accessKeyId: requireEnv("B2_KEY_ID"),
-      secretAccessKey: requireEnv("B2_APPLICATION_KEY"),
-      service: "s3",
-      region: requireEnv("B2_REGION"),
-    });
-  }
-  return b2Client;
+function boardSlug(boardHost: string, boardPath: string): string {
+  return `${boardHost}${boardPath}`.replace(/[^a-z0-9]+/gi, "_");
 }
 
-/** PUT an object straight into B2 via its S3-compatible endpoint. */
-async function putToB2(key: string, body: Uint8Array, contentType: string) {
-  const region = requireEnv("B2_REGION");
-  const bucket = requireEnv("B2_BUCKET_NAME");
-  // Encode each path segment but keep the "/" separators the key relies on.
-  const encodedKey = key.split("/").map(encodeURIComponent).join("/");
-  const url = `https://s3.${region}.backblazeb2.com/${bucket}/${encodedKey}`;
+function ghHeaders(token: string, extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    ...extra,
+  };
+}
 
-  const client = getB2Client();
-  const res = await client.fetch(url, {
-    method: "PUT",
-    body,
-    headers: { "Content-Type": contentType },
+interface GhRelease {
+  id: number;
+  upload_url: string; // templated, e.g. ".../assets{?name,label}"
+}
+
+interface GhAsset {
+  id: number;
+  name: string;
+}
+
+/** GET the release for this board's tag, creating it on first use. */
+async function getOrCreateRelease(owner: string, repo: string, tag: string, token: string): Promise<GhRelease> {
+  const base = `https://api.github.com/repos/${owner}/${repo}`;
+  const getRes = await fetch(`${base}/releases/tags/${encodeURIComponent(tag)}`, {
+    headers: ghHeaders(token),
   });
+  if (getRes.ok) return await getRes.json();
+  if (getRes.status !== 404) {
+    throw new Error(`GET release tag ${tag} failed: ${getRes.status} ${await getRes.text().catch(() => "")}`);
+  }
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`B2 PUT failed (${res.status}): ${text.slice(0, 500)}`);
+  const createRes = await fetch(`${base}/releases`, {
+    method: "POST",
+    headers: ghHeaders(token, { "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      tag_name: tag,
+      name: tag,
+      body: `Archived Futaba threads for ${tag}`,
+      draft: false,
+      prerelease: false,
+    }),
+  });
+  if (!createRes.ok) {
+    throw new Error(`create release ${tag} failed: ${createRes.status} ${await createRes.text().catch(() => "")}`);
+  }
+  return await createRes.json();
+}
+
+/**
+ * List every asset on a release (paginated — the release-by-tag
+ * response's embedded .assets field isn't reliably complete once a
+ * release has many assets, so this pages the dedicated assets endpoint
+ * instead of trusting that field).
+ */
+async function listReleaseAssets(owner: string, repo: string, releaseId: number, token: string): Promise<GhAsset[]> {
+  const assets: GhAsset[] = [];
+  let page = 1;
+  for (;;) {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/releases/${releaseId}/assets?per_page=100&page=${page}`,
+      { headers: ghHeaders(token) }
+    );
+    if (!res.ok) throw new Error(`list assets failed: ${res.status} ${await res.text().catch(() => "")}`);
+    const batch: GhAsset[] = await res.json();
+    assets.push(...batch);
+    if (batch.length < 100) break;
+    page++;
+  }
+  return assets;
+}
+
+async function deleteReleaseAsset(owner: string, repo: string, assetId: number, token: string): Promise<void> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/assets/${assetId}`, {
+    method: "DELETE",
+    headers: ghHeaders(token),
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`delete asset ${assetId} failed: ${res.status} ${await res.text().catch(() => "")}`);
   }
 }
 
-// ---------- Core per-thread archive logic (unchanged from Deno Deploy) ----------
+/** Upload the zip, replacing any existing same-named asset on this release. */
+async function uploadReleaseAsset(
+  owner: string,
+  repo: string,
+  release: GhRelease,
+  assetName: string,
+  data: Uint8Array,
+  token: string
+): Promise<{ id: number; browserDownloadUrl: string }> {
+  const existing = await listReleaseAssets(owner, repo, release.id, token);
+  const dupe = existing.find((a) => a.name === assetName);
+  if (dupe) await deleteReleaseAsset(owner, repo, dupe.id, token);
+
+  const uploadUrl = release.upload_url.replace(/\{.*\}$/, `?name=${encodeURIComponent(assetName)}`);
+  const res = await fetch(uploadUrl, {
+    method: "POST",
+    headers: ghHeaders(token, { "Content-Type": "application/zip" }),
+    body: data,
+  });
+  if (!res.ok) {
+    throw new Error(`upload asset ${assetName} failed: ${res.status} ${await res.text().catch(() => "")}`);
+  }
+  const json = await res.json();
+  return { id: json.id, browserDownloadUrl: json.browser_download_url };
+}
+
+// ---------- Core per-thread archive logic ----------
 
 interface ArchiveRequest {
   threadId: string;
@@ -679,12 +759,19 @@ async function archiveThread(req: ArchiveRequest) {
 
   const zipBytes = await buildZip(zipEntries);
 
-  const key = `${boardHost}${boardPath}${threadId}.zip`.replace(/\/+/g, "/");
-  await putToB2(key, zipBytes, "application/zip");
+  // ---- was: R2 PUT via aws4fetch; now: GitHub Release asset upload ----
+  const token = requireEnv("GITHUB_TOKEN");
+  const [owner, repo] = requireEnv("GITHUB_REPOSITORY").split("/"); // auto-set by every Actions runner
+  const tag = boardSlug(boardHost, boardPath);
+  const assetName = `${threadId}.zip`;
+
+  const release = await getOrCreateRelease(owner, repo, tag, token);
+  const { browserDownloadUrl } = await uploadReleaseAsset(owner, repo, release, assetName, zipBytes, token);
 
   return {
     ok: true,
-    key,
+    key: `${tag}/${assetName}`, // kept as "key" for callback-shape compatibility with deno-service/catalog.ts
+    assetUrl: browserDownloadUrl,
     assetCount: fetched.length,
   };
 }
@@ -714,12 +801,14 @@ function readPayload(): JobPayload {
 }
 
 /**
- * Report the outcome back to the Worker so it can update its archived/
- * pending state. Best-effort: if this fails, the job still exits with the
- * correct status code so the Actions run itself shows success/failure,
- * but the Worker's state won't be updated until the thread is re-picked-up
- * (it'll fall out of "pending" after PENDING_TIMEOUT_MS on the Worker
- * side and get retried on a later catalog pass).
+ * Report the outcome back to the Deno service so it can update its
+ * archived/pending state (now stored in this repo — see
+ * deno-service/catalog.ts's GitHub-backed state helpers). Best-effort:
+ * if this fails, the job still exits with the correct status code so the
+ * Actions run itself shows success/failure, but the Deno service's state
+ * won't be updated until the thread is re-picked-up (it'll fall out of
+ * "pending" after PENDING_TIMEOUT_MS on that side and get retried on a
+ * later catalog pass).
  */
 async function sendCallback(callbackUrl: string, payload: Record<string, unknown>) {
   const secret = Deno.env.get("CALLBACK_SECRET");
@@ -744,7 +833,7 @@ async function main() {
   const payload = readPayload();
   const { threadId, boardHost, boardPath, replies, callbackUrl } = payload;
 
-  let result: { ok: boolean; reason?: string; key?: string; assetCount?: number };
+  let result: { ok: boolean; reason?: string; key?: string; assetUrl?: string; assetCount?: number };
   try {
     result = await archiveThread(payload);
   } catch (e) {
@@ -756,7 +845,7 @@ async function main() {
   if (callbackUrl) {
     await sendCallback(callbackUrl, { threadId, boardHost, boardPath, replies, ...result });
   } else {
-    console.error("No callbackUrl in payload — Worker state will not be updated for this thread.");
+    console.error("No callbackUrl in payload — Deno service state will not be updated for this thread.");
   }
 
   // Non-zero exit on failure so the Actions run itself is visibly red in
@@ -764,13 +853,6 @@ async function main() {
   Deno.exit(result.ok ? 0 : 1);
 }
 
-// main() is called (and its rejection handled) below — see the fix note
-// carried over from the previous revision: it must actually be invoked,
-// wrapped in .catch() rather than called bare, so that a rejection
-// happening before/outside the internal try/catch (e.g. readPayload()
-// throwing on missing/invalid PAYLOAD_JSON) still gets logged and still
-// exits non-zero, instead of the job potentially reporting a false green
-// run.
 main().catch((e) => {
   console.error(`Unhandled error in main(): ${e}`);
   Deno.exit(1);
