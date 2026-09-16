@@ -1,53 +1,45 @@
-name: Sync GitHub Releases Fallback to Internet Archive
-# Drains whatever's currently sitting in this repo's Release assets (see
-# deno-service/archive-thread.ts's storage step) into Internet Archive.
-# Under normal operation this can hold quite a bit of volume — unlike a
-# true IA-first-with-fallback design, archive-thread.ts always lands the
-# ZIP in a Release asset first; this sweep (and/or catalog.ts's own
-# /sync-ia, on its own schedule) is what drains it into IA afterward.
+name: Sync TeraBox Archive to Internet Archive
+# Drains archived thread ZIPs sitting in TeraBox (see
+# deno-service/terabox-store.ts / archive-thread.ts's storage step) into
+# Internet Archive.
 #
-# STORAGE BACKEND: this used to target Backblaze B2 (B2_KEY_ID/
-# B2_APPLICATION_KEY/B2_BUCKET_NAME/B2_REGION), and before that
-# Cloudflare R2. Both are gone — this project no longer uses any
-# S3-compatible object store at all. "Folders" are now GitHub Releases
-# (one per board, tagged with that board's slug) and "objects" are that
-# release's assets. Auth is a plain GitHub bearer token instead of an
-# AWS-signature-v4-signed request, so there's no separate storage
-# provider account to manage — just this repo's own permissions.
+# STORAGE BACKEND: this used to target GitHub Releases (before that B2,
+# before that Cloudflare R2). All three are gone — this now reads/deletes
+# directly against TeraBox via the terabox-api npm package, same as the
+# rest of this project. Auth is a single long-lived TeraBox session
+# cookie (TERABOX_NDUS) instead of a GitHub token or an AWS-signature-v4
+# request.
 #
-# OVERLAP NOTE: deno-service/catalog.ts's own GET /sync-ia (optionally on
-# a SYNC_CRON schedule on the Deno service) already does this same job.
-# Running both this workflow and that schedule is safe (a double-delete
-# on an already-synced asset just 404s, which both tolerate), but if you
-# don't need this workflow's fair round-robin-across-boards sampling on
-# top of what the Deno service already does, you can delete this
-# workflow and companion script entirely and rely on /sync-ia alone.
+# PERMISSIONS: no `contents: write` needed anymore — nothing here touches
+# this repo, so the default read-only GITHUB_TOKEN is fine (and unused).
+#
+# OVERLAP NOTE: this is now the ONLY thing draining archived threads into
+# IA — deno-service/catalog.ts's own IA sync was removed when this project
+# moved off Cloudflare, so there's no second sweep to worry about
+# double-processing with anymore.
 #
 # Runs on a schedule and can also be triggered manually from the Actions
 # tab (with an optional one-off SAMPLE_LIMIT override for that run).
 on:
   schedule:
     # Every 20 minutes. Adjust to taste based on how much volume actually
-    # accumulates in Release assets between sweeps.
+    # accumulates in TeraBox between sweeps.
     - cron: "*/20 * * * *"
   workflow_dispatch:
     inputs:
       sample_limit:
         description: >
           Override SAMPLE_LIMIT for this run only (total threads to sync
-          across all releases, round-robin). Leave blank to use the
+          across all boards, round-robin). Leave blank to use the
           repo/environment variable default (45 if that's also unset).
         required: false
-
-permissions:
-  contents: write   # needed to delete a Release asset after a successful IA upload
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # Release/asset listing + up to SAMPLE_LIMIT sequential IA
-    # uploads/deletes — generous but bounded, same reasoning as
-    # archive-thread.yml's job timeout.
+    # Board listing + up to SAMPLE_LIMIT sequential IA uploads/deletes —
+    # generous but bounded, same reasoning as archive-thread.yml's job
+    # timeout.
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -56,16 +48,14 @@ jobs:
         uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - name: Sync Release-asset fallback objects to Internet Archive
+      - name: Sync TeraBox archive to Internet Archive
         env:
-          # Auto-issued per-job token, NOT a manually created secret —
-          # scoped by the `permissions: contents: write` block above.
-          # Replaces B2_KEY_ID/B2_APPLICATION_KEY/B2_BUCKET_NAME/
-          # B2_REGION entirely; no separate storage-provider secret is
-          # needed anymore.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_OWNER: ${{ github.repository_owner }}
-          GITHUB_REPO: ${{ github.event.repository.name }}
+          # TeraBox session token — replaces GITHUB_TOKEN/GITHUB_OWNER/
+          # GITHUB_REPO and B2_KEY_ID/B2_APPLICATION_KEY/B2_BUCKET_NAME/
+          # B2_REGION/R2_* entirely; no separate storage-provider account
+          # to manage beyond this one cookie value.
+          TERABOX_NDUS: ${{ secrets.TERABOX_NDUS }}
+          TERABOX_ROOT_DIR: ${{ vars.TERABOX_ROOT_DIR }}
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
           IA_IDENTIFIER: ${{ secrets.IA_IDENTIFIER }}
@@ -74,9 +64,8 @@ jobs:
           IA_ITEM_TITLE: ${{ secrets.IA_ITEM_TITLE }}
           IA_ITEM_DESCRIPTION: ${{ secrets.IA_ITEM_DESCRIPTION }}
           # Env var name kept as-is (not renamed to e.g.
-          # DELETE_FROM_RELEASES_AFTER_SYNC) for continuity with
-          # catalog.ts's own IA sync, which keeps the same name for the
-          # same reason.
+          # DELETE_FROM_TERABOX_AFTER_SYNC) for continuity with earlier
+          # revisions of this project.
           DELETE_FROM_R2_AFTER_SYNC: ${{ vars.DELETE_FROM_R2_AFTER_SYNC }}
           # workflow_dispatch input wins when provided; otherwise fall
           # back to the repo/environment variable, then the script's own
@@ -84,7 +73,6 @@ jobs:
           SAMPLE_LIMIT: ${{ github.event.inputs.sample_limit || vars.SAMPLE_LIMIT }}
         run: |
           # -A (allow-all): fresh, disposable Actions runner per job, no
-          # need to hand-pick permissions. No npm: imports anymore (the
-          # aws4fetch dependency was only needed for S3-signed requests),
-          # so this is now a plain Deno script with no external deps.
-          deno run -A deno-service/sync-releases-to-ia.ts
+          # need to hand-pick permissions. No aws4fetch/S3-signing
+          # dependency — plain terabox-api HTTP calls + IA's IAS3 fetch.
+          deno run -A deno-service/sync-terabox-to-ia.ts
