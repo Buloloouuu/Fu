@@ -1,17 +1,33 @@
 /**
  * Futaba Channel thread archiver — GitHub Actions half.
  *
- * ARCHITECTURE CHANGE (R2 -> GitHub Releases -> 0x0.st):
+ * ARCHITECTURE CHANGE (GitHub Releases -> Pixeldrain):
  *
- * This used to upload the finished ZIP straight into Cloudflare R2 via
- * R2's S3-compatible API (aws4fetch), then moved to uploading it as a
- * GitHub Release asset. Both of those are gone now — the ZIP is
- * uploaded directly to 0x0.st (https://0x0.st), a simple anonymous
- * file host, via a multipart/form-data POST. There is no per-board
- * release, no per-thread asset name, and no "delete the old asset
- * first" dance: every upload to 0x0.st gets a brand-new random URL, so
- * re-archiving a thread just produces a new URL, which is reported back
- * to the Deno service via the callback so it can update its stored link.
+ * This used to upload the finished ZIP as a GitHub Release asset (one
+ * release per board, tagged with that board's slug; one asset per
+ * thread, named "<threadId>.zip"). GitHub Releases has been dropped as
+ * the storage target. The ZIP now goes to Pixeldrain instead, via
+ * Pixeldrain's HTTP API:
+ *   - PUT https://de03.pixeldrain.com/api/file/<name>  (auth: HTTP Basic,
+ *     empty username, API key as the password) uploads the file and
+ *     returns { success, id } — `id` is Pixeldrain's own random file ID,
+ *     NOT something we get to choose, so unlike a GitHub release asset
+ *     name (or an R2 object key) there is no stable "slot" a re-upload
+ *     can just overwrite.
+ *   - Because of that, re-archiving a thread (more replies than last
+ *     time) needs the *previous* Pixeldrain file ID handed back to us
+ *     (see `previousFileId` on the payload) so the stale file can be
+ *     explicitly DELETEd before the new one is uploaded — otherwise
+ *     every re-archive would just pile up orphaned files on the account.
+ *     The Deno service is what remembers that ID between runs (it's the
+ *     thing storing "archived"/"pending" state), so it's expected to
+ *     read the previous callback's `fileId` back out of its own state
+ *     and include it as `previousFileId` on the next dispatch for that
+ *     thread.
+ *   - de03.pixeldrain.com is one of Pixeldrain's storage nodes, used
+ *     here as the upload target directly (rather than the
+ *     pixeldrain.com load balancer) — the base URL is overridable via
+ *     PIXELDRAIN_API_BASE if that ever needs to change.
  *
  * This still runs as a one-shot CLI script inside a GitHub Actions job,
  * triggered per-batch by a `repository_dispatch` event that the Deno
@@ -25,7 +41,9 @@
  * JSON result to a callback URL (the Deno service's own
  * /thread-complete endpoint — see deno-service/catalog.ts), authenticated
  * with a shared secret. The Deno service uses that callback to update
- * its "archived"/"pending" state and the asset's current URL.
+ * its "archived"/"pending" state (including the Pixeldrain file ID, so
+ * it can be passed back in as `previousFileId` next time this thread is
+ * re-archived).
  *
  * INPUT: a single JSON blob in the PAYLOAD_JSON environment variable,
  * shaped like:
@@ -39,6 +57,10 @@
  *     "maxAssetsPerThread": 40,       // optional
  *     "maxAssetBytes": 0,             // optional
  *     "offloadUploaders": [{ "prefix": "fu", "baseUrl": "..." }],
+ *     "previousFileId": "abc123",     // optional — Pixeldrain file ID from
+ *                                     // the last time this thread was
+ *                                     // archived, to be deleted before the
+ *                                     // new upload
  *     "callbackUrl": "https://your-deno-service.deno.dev/thread-complete"
  *   }
  * The Deno service builds this payload and sends it as GitHub's
@@ -48,12 +70,14 @@
  * never needs to parse individual env vars per field.
  *
  * Required environment variables:
+ *   PIXELDRAIN_API_KEY — Pixeldrain API key (from
+ *                      https://pixeldrain.com/user/api_keys), sent as
+ *                      HTTP Basic auth on every Pixeldrain API call.
  *   CALLBACK_SECRET   — must match the Deno service's CALLBACK_SECRET;
  *                      sent as `Authorization: Bearer ...` on the
  *                      callback POST.
- *
- * No GitHub token or repo permissions are required anymore — the job no
- * longer touches the GitHub API at all, only 0x0.st.
+ * Optional environment variables:
+ *   PIXELDRAIN_API_BASE — defaults to "https://de03.pixeldrain.com/api".
  */
 
 // ---------- Charset handling ----------
@@ -533,46 +557,90 @@ async function buildZip(entries: ZipEntry[]) {
   return result;
 }
 
-// ---------- 0x0.st upload (replaces R2, then GitHub Releases) ----------
+// ---------- Pixeldrain upload (replaces GitHub Releases) ----------
 //
-// 0x0.st takes a plain multipart/form-data POST with a "file" field and
-// responds with the plain-text URL of the uploaded file. There's no
-// auth, no per-board "release", and no fixed asset name to collide
-// with — every upload just gets a fresh random URL back. That also
-// means there's nothing to "delete and replace" when a thread is
-// re-archived with more replies: the old 0x0.st URL for that thread
-// simply becomes stale (and will eventually expire on 0x0's own
-// schedule — smaller files are kept longer, larger files expire
-// sooner), and the fresh URL from this run is what gets reported back
-// to the Deno service via the callback so it can update its stored
-// link for that thread.
+// Pixeldrain's upload API is a plain PUT of the file bytes, authenticated
+// with HTTP Basic auth (empty username, API key as the password) — no
+// GITHUB_TOKEN / GITHUB_REPOSITORY needed anymore, just PIXELDRAIN_API_KEY.
 //
-// 0x0.st is known to reject requests carrying a generic/default HTTP
-// client User-Agent, so this always sends an explicit one — reusing
-// the same `userAgent` value used for fetching the thread/assets is
-// good enough, and lets the caller override it via the payload if
-// 0x0.st's filtering rules ever change.
+// Unlike a GitHub release asset (keyed by name on a release) or an R2
+// object (keyed by an arbitrary key), a Pixeldrain upload always gets a
+// fresh, random file ID — the "name" in the upload URL is just filename
+// metadata, not a slot you can overwrite. So re-archiving a thread with
+// more replies than last time means explicitly deleting the *previous*
+// Pixeldrain file (by ID) rather than relying on the upload itself to
+// replace anything. That previous ID has to come in on the payload as
+// `previousFileId`, since this script has no state of its own — the Deno
+// service is what remembers it between runs.
 
-const ZIP_UPLOAD_HOST = "https://0x0.st";
+const DEFAULT_PIXELDRAIN_API_BASE = "https://de03.pixeldrain.com/api";
 
-async function uploadZipTo0x0(data: Uint8Array, filename: string, userAgent: string): Promise<{ url: string }> {
-  const form = new FormData();
-  form.set("file", new Blob([data], { type: "application/zip" }), filename);
+function requireEnv(name: string): string {
+  const v = Deno.env.get(name);
+  if (!v) throw new Error(`Missing required environment variable: ${name}`);
+  return v;
+}
 
-  const res = await fetch(ZIP_UPLOAD_HOST, {
-    method: "POST",
-    headers: { "User-Agent": userAgent },
-    body: form,
+function boardSlug(boardHost: string, boardPath: string): string {
+  return `${boardHost}${boardPath}`.replace(/[^a-z0-9]+/gi, "_");
+}
+
+function pixeldrainHeaders(apiKey: string, extra: Record<string, string> = {}): Record<string, string> {
+  // HTTP Basic auth with an empty username; the API key is the password.
+  const basic = btoa(`:${apiKey}`);
+  return {
+    Authorization: `Basic ${basic}`,
+    ...extra,
+  };
+}
+
+interface PixeldrainUploadResult {
+  id: string;
+}
+
+/**
+ * PUT the zip bytes to Pixeldrain under `name` (used only as display
+ * filename metadata — it has no bearing on the returned file ID).
+ * Throws on any non-2xx response, including Pixeldrain's documented
+ * { success: false, value, message } error shape.
+ */
+async function uploadToPixeldrain(
+  apiBase: string,
+  name: string,
+  data: Uint8Array,
+  apiKey: string
+): Promise<PixeldrainUploadResult> {
+  const res = await fetch(`${apiBase}/file/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: pixeldrainHeaders(apiKey, { "Content-Type": "application/zip" }),
+    body: data,
   });
+  const json = await res.json().catch(() => null);
+  if (!res.ok || !json?.success) {
+    const detail = json ? `${json.value ?? ""} ${json.message ?? ""}`.trim() : await res.text().catch(() => "");
+    throw new Error(`pixeldrain upload of ${name} failed: ${res.status} ${detail}`);
+  }
+  return { id: json.id };
+}
 
-  const bodyText = (await res.text()).trim();
-  if (!res.ok) {
-    throw new Error(`0x0.st upload failed: ${res.status} ${bodyText}`);
+/**
+ * Best-effort delete of a previously-uploaded Pixeldrain file (used when
+ * re-archiving a thread that grew more replies). Not fatal if it fails —
+ * the new upload should still go ahead, we just log and move on, leaving
+ * a stale file on the account rather than losing the re-archive entirely.
+ */
+async function deletePixeldrainFile(apiBase: string, fileId: string, apiKey: string): Promise<void> {
+  try {
+    const res = await fetch(`${apiBase}/file/${encodeURIComponent(fileId)}`, {
+      method: "DELETE",
+      headers: pixeldrainHeaders(apiKey),
+    });
+    if (!res.ok && res.status !== 404) {
+      console.error(`delete of previous pixeldrain file ${fileId} failed: ${res.status} ${await res.text().catch(() => "")}`);
+    }
+  } catch (e) {
+    console.error(`delete of previous pixeldrain file ${fileId} threw: ${e}`);
   }
-  if (!/^https?:\/\//i.test(bodyText)) {
-    throw new Error(`0x0.st returned an unexpected response body: ${bodyText}`);
-  }
-  return { url: bodyText };
 }
 
 // ---------- Core per-thread archive logic ----------
@@ -585,6 +653,8 @@ interface ArchiveRequest {
   maxAssetsPerThread?: number;
   maxAssetBytes?: number;
   offloadUploaders?: OffloadUploader[];
+  /** Pixeldrain file ID from a previous archive of this same thread, to delete before uploading the new one. */
+  previousFileId?: string;
 }
 
 async function archiveThread(req: ArchiveRequest) {
@@ -596,6 +666,7 @@ async function archiveThread(req: ArchiveRequest) {
     maxAssetsPerThread = 40,
     maxAssetBytes = 0,
     offloadUploaders = [],
+    previousFileId,
   } = req;
 
   const pageUrl = `https://${boardHost}${boardPath}res/${threadId}.htm`;
@@ -661,15 +732,25 @@ async function archiveThread(req: ArchiveRequest) {
 
   const zipBytes = await buildZip(zipEntries);
 
-  // ---- was: R2 PUT via aws4fetch, then GitHub Release asset upload;
-  //      now: a single anonymous POST to 0x0.st ----
-  const boardSlug = `${boardHost}${boardPath}`.replace(/[^a-z0-9]+/gi, "_");
-  const assetName = `${boardSlug}-${threadId}.zip`;
-  const { url: assetUrl } = await uploadZipTo0x0(zipBytes, assetName, userAgent);
+  // ---- was: GitHub Release asset upload; now: Pixeldrain file upload ----
+  const apiKey = requireEnv("PIXELDRAIN_API_KEY");
+  const apiBase = Deno.env.get("PIXELDRAIN_API_BASE") || DEFAULT_PIXELDRAIN_API_BASE;
+  const tag = boardSlug(boardHost, boardPath);
+  const assetName = `${tag}_${threadId}.zip`;
+
+  if (previousFileId) {
+    // Re-archiving this thread — the old upload has no stable slot to
+    // overwrite on Pixeldrain, so clear it out first.
+    await deletePixeldrainFile(apiBase, previousFileId, apiKey);
+  }
+
+  const { id: fileId } = await uploadToPixeldrain(apiBase, assetName, zipBytes, apiKey);
+  const assetUrl = `https://pixeldrain.com/api/file/${fileId}?download`;
 
   return {
     ok: true,
-    key: assetName, // kept for callback-shape compatibility with deno-service/catalog.ts
+    key: `${tag}/${assetName}`, // kept for callback-shape compatibility with deno-service/catalog.ts
+    fileId,
     assetUrl,
     assetCount: fetched.length,
   };
@@ -701,13 +782,15 @@ function readPayload(): JobPayload {
 
 /**
  * Report the outcome back to the Deno service so it can update its
- * archived/pending state and the asset's current URL (0x0.st URLs are
- * fresh on every upload, so this is the only place the new link is
- * recorded). Best-effort: if this fails, the job still exits with the
- * correct status code so the Actions run itself shows success/failure,
- * but the Deno service's state won't be updated until the thread is
- * re-picked-up (it'll fall out of "pending" after PENDING_TIMEOUT_MS on
- * that side and get retried on a later catalog pass).
+ * archived/pending state (now stored in this repo — see
+ * deno-service/catalog.ts's GitHub-backed state helpers), including the
+ * new Pixeldrain `fileId` so it can be passed back in as
+ * `previousFileId` the next time this thread is re-archived. Best-effort:
+ * if this fails, the job still exits with the correct status code so the
+ * Actions run itself shows success/failure, but the Deno service's state
+ * won't be updated until the thread is re-picked-up (it'll fall out of
+ * "pending" after PENDING_TIMEOUT_MS on that side and get retried on a
+ * later catalog pass).
  */
 async function sendCallback(callbackUrl: string, payload: Record<string, unknown>) {
   const secret = Deno.env.get("CALLBACK_SECRET");
@@ -732,7 +815,7 @@ async function main() {
   const payload = readPayload();
   const { threadId, boardHost, boardPath, replies, callbackUrl } = payload;
 
-  let result: { ok: boolean; reason?: string; key?: string; assetUrl?: string; assetCount?: number };
+  let result: { ok: boolean; reason?: string; key?: string; fileId?: string; assetUrl?: string; assetCount?: number };
   try {
     result = await archiveThread(payload);
   } catch (e) {
