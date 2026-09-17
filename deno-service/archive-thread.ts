@@ -1,17 +1,31 @@
 /**
  * Futaba Channel thread archiver — GitHub Actions half.
  *
- * Triggered per-thread by a `repository_dispatch` event that
- * deno-service/catalog.ts sends (see dispatchArchiveBatchViaGitHubActions
- * there). Since repository_dispatch is fire-and-forget, this script
- * reports back over HTTP itself once it's done: it POSTs a small JSON
- * result to a callback URL (catalog.ts's own /thread-complete endpoint
- * now — there is no more Cloudflare Worker in this project), authenticated
- * with a shared secret.
+ * ARCHITECTURE CHANGE (R2 -> GitHub Releases -> 0x0.st):
  *
- * STORAGE: uploads go straight to TeraBox now (see
- * deno-service/terabox-store.ts), not R2/S3. HTML fetching, offload-
- * uploader resolution, and ZIP building are all unchanged.
+ * This used to upload the finished ZIP straight into Cloudflare R2 via
+ * R2's S3-compatible API (aws4fetch), then moved to uploading it as a
+ * GitHub Release asset. Both of those are gone now — the ZIP is
+ * uploaded directly to 0x0.st (https://0x0.st), a simple anonymous
+ * file host, via a multipart/form-data POST. There is no per-board
+ * release, no per-thread asset name, and no "delete the old asset
+ * first" dance: every upload to 0x0.st gets a brand-new random URL, so
+ * re-archiving a thread just produces a new URL, which is reported back
+ * to the Deno service via the callback so it can update its stored link.
+ *
+ * This still runs as a one-shot CLI script inside a GitHub Actions job,
+ * triggered per-batch by a `repository_dispatch` event that the Deno
+ * service sends (see deno-service/catalog.ts's
+ * dispatchArchiveBatchViaGitHubActions, and .github/workflows/
+ * archive-thread.yml, which fans a batch back out into one matrix job
+ * per thread).
+ *
+ * Because GitHub's repository_dispatch API is fire-and-forget, this
+ * script reports back over HTTP itself once it's done: it POSTs a small
+ * JSON result to a callback URL (the Deno service's own
+ * /thread-complete endpoint — see deno-service/catalog.ts), authenticated
+ * with a shared secret. The Deno service uses that callback to update
+ * its "archived"/"pending" state and the asset's current URL.
  *
  * INPUT: a single JSON blob in the PAYLOAD_JSON environment variable,
  * shaped like:
@@ -19,21 +33,27 @@
  *     "threadId": "12345678",
  *     "boardHost": "may.2chan.net",
  *     "boardPath": "/b/",
- *     "replies": 42,
+ *     "replies": 42,                  // echoed back in the callback so the
+ *                                     // Deno service can record the right count
  *     "userAgent": "...",             // optional
  *     "maxAssetsPerThread": 40,       // optional
  *     "maxAssetBytes": 0,             // optional
  *     "offloadUploaders": [{ "prefix": "fu", "baseUrl": "..." }],
  *     "callbackUrl": "https://your-deno-service.deno.dev/thread-complete"
  *   }
+ * The Deno service builds this payload and sends it as GitHub's
+ * `client_payload`; the workflow YAML
+ * (.github/workflows/archive-thread.yml) forwards it into PAYLOAD_JSON
+ * verbatim via `toJson(github.event.client_payload)`, so this script
+ * never needs to parse individual env vars per field.
  *
- * Required environment variables (set as GitHub Actions repo/environment
- * secrets):
- *   TERABOX_NDUS      — TeraBox session cookie. See terabox-store.ts.
- *   TERABOX_ROOT_DIR  — optional, defaults to /futaba-archive.
- *   CALLBACK_SECRET   — shared secret; must match catalog.ts's own
- *                       CALLBACK_SECRET. Sent as `Authorization: Bearer
- *                       ...` on the callback POST.
+ * Required environment variables:
+ *   CALLBACK_SECRET   — must match the Deno service's CALLBACK_SECRET;
+ *                      sent as `Authorization: Bearer ...` on the
+ *                      callback POST.
+ *
+ * No GitHub token or repo permissions are required anymore — the job no
+ * longer touches the GitHub API at all, only 0x0.st.
  */
 
 // ---------- Charset handling ----------
@@ -57,7 +77,9 @@ function decodeBuffer(buffer: ArrayBuffer, contentTypeHeader: string | null) {
 
 /**
  * The saved index.html is always written out as fresh UTF-8 bytes, so any
- * stale "charset=Shift_JIS" declaration left in the page needs rewriting.
+ * stale "charset=Shift_JIS" declaration left in the page needs rewriting —
+ * otherwise a browser opening index.html straight from the zip (no MIME
+ * wrapper to override it) would mis-decode all the Japanese text.
  */
 function forceUtf8Meta(html: string) {
   let out = html.replace(
@@ -75,6 +97,13 @@ function forceUtf8Meta(html: string) {
 
 const ASSET_HREF_EXTENSIONS = /\.(jpe?g|png|gif|webp|bmp|webm|mp4|txt)(\?|#|$)/i;
 
+/**
+ * Pull out URLs that are actual content assets — post images, video,
+ * attached text files, and the stylesheet — while ignoring ad/tracking
+ * iframes and scripts. Only <img>/<video>/<source> src, <link
+ * rel=stylesheet> href, and <a href> links to media/text extensions are
+ * considered; iframe/script/object src is skipped on purpose.
+ */
 function extractAssetUrls(html: string) {
   const urls = new Set<string>();
   const attrValue = (tag: string, attr: string) => {
@@ -111,9 +140,15 @@ function extractAssetUrls(html: string) {
 
 /**
  * Futaba wraps each posted image as `<a href="FULL"><img src="THUMB" ...>
- * </a>`. Fetching both doubles outbound requests per image for no
- * benefit, since the full-size original is a superset of the thumbnail.
- * Returns a Map<thumbRawUrl, fullRawUrl> so the thumbnail can be skipped.
+ * </a>` — a link to the full-size original around a smaller thumbnail
+ * preview. Fetching both doubles outbound requests (and bytes) per image
+ * for no benefit, since the full-size original is a superset of what the
+ * thumbnail shows. This finds those pairs so the thumbnail can be
+ * skipped entirely: only the full-size URL goes out over the network,
+ * and both the <a href> and the <img src> end up pointing at that one
+ * fetched local asset.
+ *
+ * Returns a Map<thumbRawUrl, fullRawUrl>.
  */
 function extractLinkedThumbnails(html: string) {
   const map = new Map<string, string>();
@@ -130,6 +165,11 @@ function extractLinkedThumbnails(html: string) {
   return map;
 }
 
+/**
+ * Pull just the stylesheet URL(s) referenced via <link rel="stylesheet">.
+ * Kept separate from extractAssetUrls so the caller can single CSS out
+ * for the warm-instance cache below without touching post images/video.
+ */
 function extractStylesheetUrls(html: string) {
   const urls = new Set<string>();
   const linkRe = /<link\b[^>]*>/gi;
@@ -145,15 +185,35 @@ function extractStylesheetUrls(html: string) {
   return urls;
 }
 
+/**
+ * NOTE ON THE CSS CACHE: an earlier Deno Deploy version cached each
+ * board's shared stylesheet in a module-level Map so a warm isolate
+ * could skip re-fetching it across several calls in a row. That trick
+ * doesn't apply here — each GitHub Actions job is a fresh process (a new
+ * VM), so there's no "warm instance" to carry a cache between threads.
+ * The stylesheet is simply fetched fresh, once, per job. If this ever
+ * becomes worth optimizing, `actions/cache` keyed on board host could
+ * persist it across job runs, but for a single small CSS file it isn't
+ * worth the added complexity.
+ */
+
 // ---------- Offload uploaders (generic — config comes from the payload) ----------
 
 const OFFLOAD_EXTENSIONS = "jpe?g|png|gif|webp|bmp|webm|mp4|txt";
 
 interface OffloadUploader {
-  prefix: string;
-  baseUrl: string;
+  prefix: string; // e.g. "fu", "f3"
+  baseUrl: string; // absolute, trailing-slash-normalized by the caller
 }
 
+/**
+ * Bare filenames like "fu6988461.jpg" or "f3204512.png" need their
+ * uploader's base URL prepended to actually be fetchable. Scans the raw
+ * HTML/text for these patterns (not just tag attributes) since they can
+ * appear as plain text in a post body too. `uploaders` is whatever list
+ * the Deno service sent in this request — this function has no built-in
+ * knowledge of which prefixes exist.
+ */
 function extractOffloadedAssetUrls(html: string, uploaders: OffloadUploader[]) {
   const urls = new Set<string>();
   for (const uploader of uploaders) {
@@ -167,6 +227,12 @@ function extractOffloadedAssetUrls(html: string, uploaders: OffloadUploader[]) {
   return [...urls];
 }
 
+/**
+ * Rewrite src="<prefix>....ext" / href="<prefix>....ext" to each
+ * uploader's absolute URL, in place, so the saved page actually renders
+ * those assets. Plain-text mentions outside an attribute are left
+ * untouched.
+ */
 function rewriteOffloadedReferences(html: string, uploaders: OffloadUploader[]) {
   let out = html;
   for (const uploader of uploaders) {
@@ -180,6 +246,11 @@ function rewriteOffloadedReferences(html: string, uploaders: OffloadUploader[]) 
   return out;
 }
 
+/**
+ * Replace every quoted occurrence of any of several exact attribute values
+ * with their corresponding new value, in a single pass over the HTML.
+ * `valueMap`: Map<rawValue, newValue>.
+ */
 function replaceAttributeValues(html: string, valueMap: Map<string, string>) {
   const keys = [...valueMap.keys()];
   if (keys.length === 0) return html;
@@ -188,6 +259,11 @@ function replaceAttributeValues(html: string, valueMap: Map<string, string>) {
   return html.replace(re, (_whole, quote, matched) => `${quote}${valueMap.get(matched)}${quote}`);
 }
 
+/**
+ * Derive a safe, unique filename for an asset inside assets/, based on the
+ * last path segment of its real URL. Falls back to a generic name and
+ * de-duplicates against anything already used this run.
+ */
 function localFilenameFor(absoluteUrl: string, usedNames: Set<string>) {
   let base = "asset";
   try {
@@ -218,6 +294,12 @@ interface FetchedAsset extends AssetRef {
   buffer: ArrayBuffer;
 }
 
+/**
+ * Fetch a batch of {raw, absolute} URL pairs with limited concurrency.
+ * `maxAssetBytes`, if set, skips embedding anything over that size —
+ * checked via Content-Length first, then again after download as a
+ * fallback for servers that omit that header.
+ */
 async function fetchAssets(refs: AssetRef[], userAgent: string, maxAssetBytes: number): Promise<FetchedAsset[]> {
   const results: FetchedAsset[] = [];
   let idx = 0;
@@ -247,6 +329,11 @@ async function fetchAssets(refs: AssetRef[], userAgent: string, maxAssetBytes: n
   return results;
 }
 
+/**
+ * Deflate `data` with no zlib/gzip wrapper — exactly the raw-deflate
+ * stream format ZIP's "deflate" compression method (8) expects. Uses
+ * Deno's built-in CompressionStream, so no extra dependency is needed.
+ */
 async function deflateRaw(data: Uint8Array): Promise<Uint8Array> {
   const cs = new CompressionStream("deflate-raw");
   const writer = cs.writable.getWriter();
@@ -286,6 +373,11 @@ const CRC_TABLE = (() => {
   return table;
 })();
 
+// "Slicing-by-8": precompute 7 more tables so the main loop consumes 8
+// bytes per iteration instead of 1. GitHub Actions runners give a full
+// 2-core VM per job with no CPU-time metering, so this is even less of a
+// concern than on a serverless platform — kept as-is since it's still
+// cheap insurance on large multi-MB video buffers.
 const CRC_TABLES = (() => {
   const tables = [CRC_TABLE];
   for (let t = 1; t < 8; t++) {
@@ -337,9 +429,21 @@ function dosDateTime(date = new Date()) {
 interface ZipEntry {
   name: string;
   data: Uint8Array;
+  /**
+   * Deflate this entry (method 8) instead of storing it raw (method 0).
+   * Only worth setting for text — index.html and any .txt attachments —
+   * since images/video/audio are already compressed and deflating them
+   * again just burns CPU for ~0 savings.
+   */
   compress?: boolean;
 }
 
+/**
+ * Build a standard ZIP archive from a list of entries. Entries flagged
+ * `compress` are deflated (falling back to store if deflate somehow comes
+ * out larger, e.g. for tiny inputs); everything else is stored as-is.
+ * Returns a Uint8Array of the complete .zip file.
+ */
 async function buildZip(entries: ZipEntry[]) {
   const encoder = new TextEncoder();
   const { time, dateVal } = dosDateTime();
@@ -429,9 +533,47 @@ async function buildZip(entries: ZipEntry[]) {
   return result;
 }
 
-// ---------- TeraBox upload (replaces the old R2 PUT) ----------
+// ---------- 0x0.st upload (replaces R2, then GitHub Releases) ----------
+//
+// 0x0.st takes a plain multipart/form-data POST with a "file" field and
+// responds with the plain-text URL of the uploaded file. There's no
+// auth, no per-board "release", and no fixed asset name to collide
+// with — every upload just gets a fresh random URL back. That also
+// means there's nothing to "delete and replace" when a thread is
+// re-archived with more replies: the old 0x0.st URL for that thread
+// simply becomes stale (and will eventually expire on 0x0's own
+// schedule — smaller files are kept longer, larger files expire
+// sooner), and the fresh URL from this run is what gets reported back
+// to the Deno service via the callback so it can update its stored
+// link for that thread.
+//
+// 0x0.st is known to reject requests carrying a generic/default HTTP
+// client User-Agent, so this always sends an explicit one — reusing
+// the same `userAgent` value used for fetching the thread/assets is
+// good enough, and lets the caller override it via the payload if
+// 0x0.st's filtering rules ever change.
 
-import { putObject as tbPutObject, pathFor } from "./terabox-store.ts";
+const ZIP_UPLOAD_HOST = "https://0x0.st";
+
+async function uploadZipTo0x0(data: Uint8Array, filename: string, userAgent: string): Promise<{ url: string }> {
+  const form = new FormData();
+  form.set("file", new Blob([data], { type: "application/zip" }), filename);
+
+  const res = await fetch(ZIP_UPLOAD_HOST, {
+    method: "POST",
+    headers: { "User-Agent": userAgent },
+    body: form,
+  });
+
+  const bodyText = (await res.text()).trim();
+  if (!res.ok) {
+    throw new Error(`0x0.st upload failed: ${res.status} ${bodyText}`);
+  }
+  if (!/^https?:\/\//i.test(bodyText)) {
+    throw new Error(`0x0.st returned an unexpected response body: ${bodyText}`);
+  }
+  return { url: bodyText };
+}
 
 // ---------- Core per-thread archive logic ----------
 
@@ -465,12 +607,20 @@ async function archiveThread(req: ArchiveRequest) {
   const buffer = await res.arrayBuffer();
   const { text: rawHtml } = decodeBuffer(buffer, res.headers.get("content-type"));
 
+  // Fetch bare "<prefix>NNNN.ext" mentions too (including ones only in
+  // plain post text), for every uploader the Deno service told us about.
   const offloadedUrls = extractOffloadedAssetUrls(rawHtml, offloadUploaders);
 
+  // Resolve bare filenames appearing in src/href to their real absolute
+  // offload URL, and fix the charset declaration to match the UTF-8 bytes
+  // we're about to write.
   let html = rewriteOffloadedReferences(rawHtml, offloadUploaders);
   html = forceUtf8Meta(html);
 
+  // Thumbnails paired with a full-size <a href> are dropped from the
+  // outbound fetch list entirely — only the full-size original is fetched.
   const thumbToFull = extractLinkedThumbnails(html);
+
   const stylesheetUrls = extractStylesheetUrls(html);
 
   const rawAssetRefs = extractAssetUrls(html).filter((url) => !thumbToFull.has(url));
@@ -499,6 +649,8 @@ async function archiveThread(req: ArchiveRequest) {
       compress: /\.txt$/i.test(localName) || stylesheetUrls.has(asset.raw),
     });
   }
+  // Point each skipped thumbnail at the same local asset as the full-size
+  // image it was paired with, so the saved <img> tag still renders.
   for (const [thumb, full] of thumbToFull) {
     const mapped = valueMap.get(full);
     if (mapped) valueMap.set(thumb, mapped);
@@ -509,12 +661,16 @@ async function archiveThread(req: ArchiveRequest) {
 
   const zipBytes = await buildZip(zipEntries);
 
-  const key = `${boardHost}${boardPath}${threadId}.zip`.replace(/\/+/g, "/");
-  await tbPutObject(pathFor(key), zipBytes);
+  // ---- was: R2 PUT via aws4fetch, then GitHub Release asset upload;
+  //      now: a single anonymous POST to 0x0.st ----
+  const boardSlug = `${boardHost}${boardPath}`.replace(/[^a-z0-9]+/gi, "_");
+  const assetName = `${boardSlug}-${threadId}.zip`;
+  const { url: assetUrl } = await uploadZipTo0x0(zipBytes, assetName, userAgent);
 
   return {
     ok: true,
-    key,
+    key: assetName, // kept for callback-shape compatibility with deno-service/catalog.ts
+    assetUrl,
     assetCount: fetched.length,
   };
 }
@@ -543,6 +699,16 @@ function readPayload(): JobPayload {
   return parsed;
 }
 
+/**
+ * Report the outcome back to the Deno service so it can update its
+ * archived/pending state and the asset's current URL (0x0.st URLs are
+ * fresh on every upload, so this is the only place the new link is
+ * recorded). Best-effort: if this fails, the job still exits with the
+ * correct status code so the Actions run itself shows success/failure,
+ * but the Deno service's state won't be updated until the thread is
+ * re-picked-up (it'll fall out of "pending" after PENDING_TIMEOUT_MS on
+ * that side and get retried on a later catalog pass).
+ */
 async function sendCallback(callbackUrl: string, payload: Record<string, unknown>) {
   const secret = Deno.env.get("CALLBACK_SECRET");
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -566,7 +732,7 @@ async function main() {
   const payload = readPayload();
   const { threadId, boardHost, boardPath, replies, callbackUrl } = payload;
 
-  let result: { ok: boolean; reason?: string; key?: string; assetCount?: number };
+  let result: { ok: boolean; reason?: string; key?: string; assetUrl?: string; assetCount?: number };
   try {
     result = await archiveThread(payload);
   } catch (e) {
@@ -578,9 +744,11 @@ async function main() {
   if (callbackUrl) {
     await sendCallback(callbackUrl, { threadId, boardHost, boardPath, replies, ...result });
   } else {
-    console.error("No callbackUrl in payload — catalog.ts's state will not be updated for this thread.");
+    console.error("No callbackUrl in payload — Deno service state will not be updated for this thread.");
   }
 
+  // Non-zero exit on failure so the Actions run itself is visibly red in
+  // the GitHub UI, independent of whether the callback succeeded.
   Deno.exit(result.ok ? 0 : 1);
 }
 
