@@ -9,30 +9,33 @@ name: Archive Futaba Thread
 #
 # workflow_dispatch is still wired up for manual testing from the Actions
 # tab, and accepts EITHER shape in the `payload` input:
-#   - a full batch payload, same shape as the Deno service sends:
-#       {"threads":[{"threadId":"...","replies":0}],"boardHost":"...",
-#        "boardPath":"...","userAgent":"...","maxAssetsPerThread":40,
-#        "maxAssetBytes":0,"offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
+#   - a full batch payload, same shape as the Deno service sends. Each
+#     thread entry MAY carry its own "previousFileId" (the Pixeldrain
+#     file ID from that thread's last archive, if any) so archive-thread.ts
+#     can delete the stale upload before archiving it again:
+#       {"threads":[{"threadId":"...","replies":0,"previousFileId":"abc123"}],
+#        "boardHost":"...","boardPath":"...","userAgent":"...",
+#        "maxAssetsPerThread":40,"maxAssetBytes":0,
+#        "offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
 #        "callbackUrl":"https://your-deno-service.deno.dev/thread-complete"}
 #   - or the older single-thread shape, for a quick one-off test:
 #       {"threadId":"...","boardHost":"...","boardPath":"...","replies":0,
-#        "userAgent":"...","maxAssetsPerThread":40,"maxAssetBytes":0,
-#        "offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
+#        "previousFileId":"abc123","userAgent":"...","maxAssetsPerThread":40,
+#        "maxAssetBytes":0,"offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
 #        "callbackUrl":"https://your-deno-service.deno.dev/thread-complete"}
 # The "prepare" job below detects which shape it got and normalizes both
 # into the same {threads, shared} split, so "archive" only ever has to
 # handle one case.
 #
-# ARCHITECTURE CHANGE (R2 -> GitHub Releases -> 0x0.st):
-# archive-thread.ts no longer uploads the finished ZIP to Cloudflare R2
-# or to a GitHub Release. It now POSTs the ZIP straight to 0x0.st
-# (https://0x0.st), an anonymous file host, and gets back a plain URL.
-# That means this job no longer touches the GitHub API at all: it
-# doesn't need the auto-issued GITHUB_TOKEN, and the job no longer needs
-# `contents: write` permission (the "permissions" block below has been
-# removed — the default read-only GITHUB_TOKEN is fine, since it's
-# unused). All the archiver needs now is outbound network access and
-# CALLBACK_SECRET to report results back to the Deno service.
+# ARCHITECTURE CHANGE (GitHub Releases -> Pixeldrain):
+# archive-thread.ts no longer uploads the finished ZIP as a GitHub
+# Release asset. It now PUTs the ZIP straight to Pixeldrain's API
+# (https://de03.pixeldrain.com/api/file/<name> by default), authenticated
+# with a Pixeldrain API key (PIXELDRAIN_API_KEY secret) rather than the
+# job's auto-issued GITHUB_TOKEN. Since nothing in this job creates
+# GitHub releases or uploads release assets anymore, the job no longer
+# needs `contents: write` — GITHUB_TOKEN keeps its default read-only
+# permissions.
 on:
   repository_dispatch:
     types: [archive-thread]
@@ -50,8 +53,8 @@ jobs:
   # Normalizes both trigger types / both payload shapes into:
   #   - threads_matrix: a compact JSON array of {threadId, replies}
   #   - shared: everything else (boardHost, boardPath, userAgent,
-  #     maxAssetsPerThread, maxAssetBytes, offloadUploaders, callbackUrl),
-  #     common to every thread in this run
+  #     maxAssetsPerThread, maxAssetBytes, offloadUploaders, callbackUrl,
+  #     previousFileId), common to every thread in this run
   # so the "archive" job's matrix and per-thread payload assembly stay
   # identical regardless of how this run was triggered.
   prepare:
@@ -78,14 +81,18 @@ jobs:
 
           if jq -e 'has("threads")' payload.json > /dev/null; then
             # Batch shape (from the Deno service, or a manually pasted batch).
-            jq -c '[.threads[] | {threadId, replies}]' payload.json > threads.json
+            # previousFileId travels per-thread (it's the Pixeldrain file ID
+            # from that specific thread's last archive, not something every
+            # thread in the batch shares), so it's kept alongside threadId/
+            # replies here instead of falling into "shared".
+            jq -c '[.threads[] | {threadId, replies, previousFileId}]' payload.json > threads.json
             jq -c 'del(.threads)' payload.json > shared.json
           else
             # Legacy single-thread shape (manual test) — wrap it into a
             # one-entry "threads" array so the matrix below is identical
             # either way.
-            jq -c '[{threadId, replies}]' payload.json > threads.json
-            jq -c 'del(.threadId, .replies)' payload.json > shared.json
+            jq -c '[{threadId, replies, previousFileId}]' payload.json > threads.json
+            jq -c 'del(.threadId, .replies, .previousFileId)' payload.json > shared.json
           fi
 
           echo "threads_matrix=$(cat threads.json)" >> "$GITHUB_OUTPUT"
@@ -105,8 +112,7 @@ jobs:
       # Caps how many threads from this one batch archive concurrently.
       # GitHub's own ceiling is 256 matrix jobs per run; this is a lower,
       # source-site-friendly limit so one batch doesn't hit Futaba (or the
-      # offload-uploader hosts, or 0x0.st) with dozens of simultaneous
-      # requests at once.
+      # offload-uploader hosts) with dozens of simultaneous fetches at once.
       max-parallel: 10
       matrix:
         include: ${{ fromJson(needs.prepare.outputs.threads_matrix) }}
@@ -125,21 +131,30 @@ jobs:
           echo '${{ needs.prepare.outputs.shared }}' | jq \
             --arg threadId "${{ matrix.threadId }}" \
             --argjson replies ${{ matrix.replies }} \
-            '. + {threadId: $threadId, replies: $replies}' > payload.json
+            --arg previousFileId "${{ matrix.previousFileId }}" \
+            '. + {threadId: $threadId, replies: $replies}
+               + (if $previousFileId == "" then {} else {previousFileId: $previousFileId} end)' > payload.json
           jq empty payload.json
       - name: Archive thread
         env:
           PAYLOAD_JSON_FILE: payload.json
+          # Pixeldrain API key, sent as HTTP Basic auth on every
+          # Pixeldrain API call archive-thread.ts makes (upload, and
+          # delete-previous-file on re-archive). Was GITHUB_TOKEN /
+          # GITHUB_REPOSITORY before GitHub Releases was dropped as the
+          # upload target — neither is needed anymore.
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+          # Optional override of the Pixeldrain API base URL; defaults to
+          # https://de03.pixeldrain.com/api inside archive-thread.ts if unset.
+          PIXELDRAIN_API_BASE: ${{ vars.PIXELDRAIN_API_BASE }}
           # Must match the Deno service's own CALLBACK_SECRET — used to
           # authenticate the POST to the Deno service's /thread-complete
-          # endpoint once this job finishes. This is the only secret the
-          # job needs now; there's no GITHUB_TOKEN / repo permissions
-          # requirement anymore since uploads go straight to 0x0.st.
+          # endpoint once this job finishes.
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           export PAYLOAD_JSON="$(cat "$PAYLOAD_JSON_FILE")"
           # -A (allow-all): this runner is a fresh, disposable VM per job,
           # so there's no reason to hand-pick permissions — Deno needs
-          # net (fetch), env (reading PAYLOAD_JSON/CALLBACK_SECRET/etc),
+          # net (fetch), env (reading PAYLOAD_JSON/PIXELDRAIN_API_KEY/etc),
           # and read/write (module cache for any npm: imports) at minimum.
           deno run -A deno-service/archive-thread.ts
