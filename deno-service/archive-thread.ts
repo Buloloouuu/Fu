@@ -603,6 +603,16 @@ interface PixeldrainUploadResult {
  * filename metadata — it has no bearing on the returned file ID).
  * Throws on any non-2xx response, including Pixeldrain's documented
  * { success: false, value, message } error shape.
+ *
+ * FIX: the body is read exactly once, as text, before attempting to
+ * parse it as JSON. The previous version called res.json() first and,
+ * on parse failure, fell back to res.text() on the SAME Response object
+ * for error detail — but a Response's body stream can only be read
+ * once. That second read threw ("body already used"), got swallowed by
+ * its own .catch(() => ""), and produced an empty error detail no
+ * matter what actually went wrong (e.g. "failed: 201 " with nothing
+ * after it). Reading as text first and JSON.parse()-ing that text keeps
+ * the raw body available for diagnostics either way.
  */
 async function uploadToPixeldrain(
   apiBase: string,
@@ -615,10 +625,20 @@ async function uploadToPixeldrain(
     headers: pixeldrainHeaders(apiKey, { "Content-Type": "application/zip" }),
     body: data,
   });
-  const json = await res.json().catch(() => null);
+
+  const text = await res.text().catch(() => "");
+  let json: any = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch (_e) {
+    json = null;
+  }
+
   if (!res.ok || !json?.success) {
-    const detail = json ? `${json.value ?? ""} ${json.message ?? ""}`.trim() : await res.text().catch(() => "");
-    throw new Error(`pixeldrain upload of ${name} failed: ${res.status} ${detail}`);
+    const detail = json
+      ? `${json.value ?? ""} ${json.message ?? ""}`.trim()
+      : text.slice(0, 300); // raw body, in case it wasn't JSON at all
+    throw new Error(`pixeldrain upload of ${name} failed: ${res.status} ${detail || "(empty response body)"}`);
   }
   return { id: json.id };
 }
