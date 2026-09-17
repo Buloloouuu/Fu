@@ -1,15 +1,15 @@
 name: Archive Futaba Thread
-# Triggered by deno-service/catalog.ts via GitHub's repository_dispatch API
-# (dispatchArchiveBatchViaGitHubActions). ONE event carries a BATCH of
+# Triggered by the Deno Deploy service via GitHub's repository_dispatch
+# API (see deno-service/catalog.ts's dispatchArchiveBatchViaGitHubActions
+# — this used to be sent by a Cloudflare Worker; Cloudflare has been
+# dropped from this project entirely, the Deno service now owns
+# scheduling AND dispatch on its own). ONE event carries a BATCH of
 # threads under client_payload.threads = [{threadId, replies}, ...], so
 # this workflow fans that array back out into one matrix job per thread.
 #
-# STORAGE: uploads go to TeraBox now (see deno-service/terabox-store.ts),
-# not R2. TERABOX_NDUS replaces the old R2_* secrets.
-#
 # workflow_dispatch is still wired up for manual testing from the Actions
-# tab, and accepts EITHER shape in the payload input:
-#   - a full batch payload, same shape catalog.ts sends:
+# tab, and accepts EITHER shape in the `payload` input:
+#   - a full batch payload, same shape as the Deno service sends:
 #       {"threads":[{"threadId":"...","replies":0}],"boardHost":"...",
 #        "boardPath":"...","userAgent":"...","maxAssetsPerThread":40,
 #        "maxAssetBytes":0,"offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
@@ -22,6 +22,17 @@ name: Archive Futaba Thread
 # The "prepare" job below detects which shape it got and normalizes both
 # into the same {threads, shared} split, so "archive" only ever has to
 # handle one case.
+#
+# ARCHITECTURE CHANGE (R2 -> GitHub Releases -> 0x0.st):
+# archive-thread.ts no longer uploads the finished ZIP to Cloudflare R2
+# or to a GitHub Release. It now POSTs the ZIP straight to 0x0.st
+# (https://0x0.st), an anonymous file host, and gets back a plain URL.
+# That means this job no longer touches the GitHub API at all: it
+# doesn't need the auto-issued GITHUB_TOKEN, and the job no longer needs
+# `contents: write` permission (the "permissions" block below has been
+# removed — the default read-only GITHUB_TOKEN is fine, since it's
+# unused). All the archiver needs now is outbound network access and
+# CALLBACK_SECRET to report results back to the Deno service.
 on:
   repository_dispatch:
     types: [archive-thread]
@@ -29,9 +40,10 @@ on:
     inputs:
       payload:
         description: >
-          JSON payload — either a full batch (same shape as catalog.ts's
-          client_payload, with a "threads" array) or a single-thread
-          payload (top-level "threadId"/"replies") for a quick manual test.
+          JSON payload — either a full batch (same shape as the Deno
+          service's client_payload, with a "threads" array) or a
+          single-thread payload (top-level "threadId"/"replies") for a
+          quick manual test.
         required: true
 
 jobs:
@@ -65,7 +77,7 @@ jobs:
           jq empty payload.json
 
           if jq -e 'has("threads")' payload.json > /dev/null; then
-            # Batch shape (from catalog.ts, or a manually pasted batch).
+            # Batch shape (from the Deno service, or a manually pasted batch).
             jq -c '[.threads[] | {threadId, replies}]' payload.json > threads.json
             jq -c 'del(.threads)' payload.json > shared.json
           else
@@ -93,7 +105,8 @@ jobs:
       # Caps how many threads from this one batch archive concurrently.
       # GitHub's own ceiling is 256 matrix jobs per run; this is a lower,
       # source-site-friendly limit so one batch doesn't hit Futaba (or the
-      # offload-uploader hosts) with dozens of simultaneous fetches at once.
+      # offload-uploader hosts, or 0x0.st) with dozens of simultaneous
+      # requests at once.
       max-parallel: 10
       matrix:
         include: ${{ fromJson(needs.prepare.outputs.threads_matrix) }}
@@ -106,8 +119,7 @@ jobs:
           deno-version: v2.x
       # Merges this matrix entry's {threadId, replies} back into the
       # shared fields from "prepare", producing exactly the same
-      # single-thread PAYLOAD_JSON shape archive-thread.ts already expects
-      # — that script needed no changes for batching.
+      # single-thread PAYLOAD_JSON shape archive-thread.ts already expects.
       - name: Build payload for this thread
         run: |
           echo '${{ needs.prepare.outputs.shared }}' | jq \
@@ -118,22 +130,16 @@ jobs:
       - name: Archive thread
         env:
           PAYLOAD_JSON_FILE: payload.json
-          # TeraBox session token — the only credential archive-thread.ts
-          # needs for storage now. Replaces R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/
-          # R2_SECRET_ACCESS_KEY/R2_BUCKET_NAME.
-          TERABOX_NDUS: ${{ secrets.TERABOX_NDUS }}
-          # Optional — defaults to /futaba-archive in terabox-store.ts if unset.
-          TERABOX_ROOT_DIR: ${{ vars.TERABOX_ROOT_DIR }}
-          # Renamed from W_SHARED_SECRET now that there's no Cloudflare
-          # Worker to name it after — same value, re-saved under this name.
+          # Must match the Deno service's own CALLBACK_SECRET — used to
+          # authenticate the POST to the Deno service's /thread-complete
+          # endpoint once this job finishes. This is the only secret the
+          # job needs now; there's no GITHUB_TOKEN / repo permissions
+          # requirement anymore since uploads go straight to 0x0.st.
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           export PAYLOAD_JSON="$(cat "$PAYLOAD_JSON_FILE")"
-          # -A (allow-all): fresh, disposable Actions runner per job, no
-          # need to hand-pick permissions. Needed at minimum for
-          # --allow-net (fetch + TeraBox API calls), --allow-env
-          # (TERABOX_NDUS/CALLBACK_SECRET/PAYLOAD_JSON), and
-          # --allow-read/--allow-write (npm package cache, plus
-          # hashFile/uploadChunks writing the ZIP to a temp file before
-          # upload — see terabox-store.ts).
+          # -A (allow-all): this runner is a fresh, disposable VM per job,
+          # so there's no reason to hand-pick permissions — Deno needs
+          # net (fetch), env (reading PAYLOAD_JSON/CALLBACK_SECRET/etc),
+          # and read/write (module cache for any npm: imports) at minimum.
           deno run -A deno-service/archive-thread.ts
