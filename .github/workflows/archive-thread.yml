@@ -10,9 +10,10 @@ name: Archive Futaba Thread
 # workflow_dispatch is still wired up for manual testing from the Actions
 # tab, and accepts EITHER shape in the `payload` input:
 #   - a full batch payload, same shape as the Deno service sends. Each
-#     thread entry MAY carry its own "previousFileId" (the Pixeldrain
-#     file ID from that thread's last archive, if any) so archive-thread.ts
-#     can delete the stale upload before archiving it again:
+#     thread entry MAY carry its own "previousFileId" (the Gofile
+#     content id from that thread's last archive, if any) so
+#     archive-thread.ts can delete the stale upload before archiving it
+#     again:
 #       {"threads":[{"threadId":"...","replies":0,"previousFileId":"abc123"}],
 #        "boardHost":"...","boardPath":"...","userAgent":"...",
 #        "maxAssetsPerThread":40,"maxAssetBytes":0,
@@ -27,15 +28,16 @@ name: Archive Futaba Thread
 # into the same {threads, shared} split, so "archive" only ever has to
 # handle one case.
 #
-# ARCHITECTURE CHANGE (GitHub Releases -> Pixeldrain):
+# ARCHITECTURE CHANGE (GitHub Releases -> Pixeldrain -> Gofile):
 # archive-thread.ts no longer uploads the finished ZIP as a GitHub
-# Release asset. It now PUTs the ZIP straight to Pixeldrain's API
-# (https://de03.pixeldrain.com/api/file/<name> by default), authenticated
-# with a Pixeldrain API key (PIXELDRAIN_API_KEY secret) rather than the
-# job's auto-issued GITHUB_TOKEN. Since nothing in this job creates
-# GitHub releases or uploads release assets anymore, the job no longer
-# needs `contents: write` — GITHUB_TOKEN keeps its default read-only
-# permissions.
+# Release asset, and no longer uploads it to Pixeldrain either. It now
+# POSTs the ZIP straight to Gofile's upload API
+# (https://upload.gofile.io/uploadfile by default) as multipart/form-data,
+# authenticated with a Gofile account token (GOFILE_API_TOKEN secret)
+# rather than the job's auto-issued GITHUB_TOKEN. Since nothing in this
+# job creates GitHub releases or uploads release assets anymore, the job
+# no longer needs `contents: write` — GITHUB_TOKEN keeps its default
+# read-only permissions.
 on:
   repository_dispatch:
     types: [archive-thread]
@@ -81,7 +83,7 @@ jobs:
 
           if jq -e 'has("threads")' payload.json > /dev/null; then
             # Batch shape (from the Deno service, or a manually pasted batch).
-            # previousFileId travels per-thread (it's the Pixeldrain file ID
+            # previousFileId travels per-thread (it's the Gofile content id
             # from that specific thread's last archive, not something every
             # thread in the batch shares), so it's kept alongside threadId/
             # replies here instead of falling into "shared".
@@ -138,15 +140,21 @@ jobs:
       - name: Archive thread
         env:
           PAYLOAD_JSON_FILE: payload.json
-          # Pixeldrain API key, sent as HTTP Basic auth on every
-          # Pixeldrain API call archive-thread.ts makes (upload, and
-          # delete-previous-file on re-archive). Was GITHUB_TOKEN /
-          # GITHUB_REPOSITORY before GitHub Releases was dropped as the
-          # upload target — neither is needed anymore.
-          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
-          # Optional override of the Pixeldrain API base URL; defaults to
-          # https://de03.pixeldrain.com/api inside archive-thread.ts if unset.
-          PIXELDRAIN_API_BASE: ${{ vars.PIXELDRAIN_API_BASE }}
+          # Gofile account token, sent as `Authorization: Bearer ...` on
+          # every Gofile API call archive-thread.ts makes (upload, and
+          # delete-previous-file on re-archive). Was Pixeldrain's
+          # PIXELDRAIN_API_KEY before Pixeldrain was dropped as the
+          # upload target; before that, GITHUB_TOKEN / GITHUB_REPOSITORY
+          # for GitHub Releases — none of those are needed anymore.
+          GOFILE_API_TOKEN: ${{ secrets.GOFILE_API_TOKEN }}
+          # Optional override of the Gofile upload server; defaults to
+          # https://upload.gofile.io/uploadfile (auto-picks the closest
+          # region) inside archive-thread.ts if unset.
+          GOFILE_UPLOAD_BASE_URL: ${{ vars.GOFILE_UPLOAD_BASE_URL }}
+          # Optional: UUID of a Gofile folder to upload every archive
+          # into. Unset means each upload gets its own new folder at the
+          # account root — see archive-thread.ts's module doc comment.
+          GOFILE_FOLDER_ID: ${{ vars.GOFILE_FOLDER_ID }}
           # Must match the Deno service's own CALLBACK_SECRET — used to
           # authenticate the POST to the Deno service's /thread-complete
           # endpoint once this job finishes.
@@ -155,6 +163,6 @@ jobs:
           export PAYLOAD_JSON="$(cat "$PAYLOAD_JSON_FILE")"
           # -A (allow-all): this runner is a fresh, disposable VM per job,
           # so there's no reason to hand-pick permissions — Deno needs
-          # net (fetch), env (reading PAYLOAD_JSON/PIXELDRAIN_API_KEY/etc),
+          # net (fetch), env (reading PAYLOAD_JSON/GOFILE_API_TOKEN/etc),
           # and read/write (module cache for any npm: imports) at minimum.
           deno run -A deno-service/archive-thread.ts
