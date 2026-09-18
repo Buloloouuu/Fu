@@ -1,33 +1,52 @@
 /**
  * Futaba Channel thread archiver — GitHub Actions half.
  *
- * ARCHITECTURE CHANGE (GitHub Releases -> Pixeldrain):
+ * ARCHITECTURE CHANGE (GitHub Releases -> Pixeldrain -> Gofile):
  *
  * This used to upload the finished ZIP as a GitHub Release asset (one
  * release per board, tagged with that board's slug; one asset per
- * thread, named "<threadId>.zip"). GitHub Releases has been dropped as
- * the storage target. The ZIP now goes to Pixeldrain instead, via
- * Pixeldrain's HTTP API:
- *   - PUT https://de03.pixeldrain.com/api/file/<name>  (auth: HTTP Basic,
- *     empty username, API key as the password) uploads the file and
- *     returns { success, id } — `id` is Pixeldrain's own random file ID,
- *     NOT something we get to choose, so unlike a GitHub release asset
- *     name (or an R2 object key) there is no stable "slot" a re-upload
- *     can just overwrite.
+ * thread, named "<threadId>.zip"), then briefly as a Pixeldrain upload.
+ * Both have been dropped as the storage target. The ZIP now goes to
+ * Gofile instead, via Gofile's HTTP API:
+ *   - POST https://upload.gofile.io/uploadfile as multipart/form-data
+ *     (field "file", plus an optional "folderId" — see GOFILE_FOLDER_ID
+ *     below), authenticated with `Authorization: Bearer <token>`.
+ *     Uploads land under the account that owns the token; without a
+ *     token Gofile would silently create a throwaway guest account
+ *     instead, which is why GOFILE_API_TOKEN is required rather than
+ *     optional here. Success responses look like
+ *     { "status": "ok", "data": { "id": "...", "downloadPage": "...",
+ *     ... } } — `data.id` is Gofile's own random content ID, NOT
+ *     something we get to choose, so exactly like the Pixeldrain setup
+ *     this replaced, there is no stable "slot" a re-upload can just
+ *     overwrite.
  *   - Because of that, re-archiving a thread (more replies than last
- *     time) needs the *previous* Pixeldrain file ID handed back to us
+ *     time) needs the *previous* Gofile content ID handed back to us
  *     (see `previousFileId` on the payload) so the stale file can be
  *     explicitly DELETEd before the new one is uploaded — otherwise
- *     every re-archive would just pile up orphaned files on the account.
- *     The Deno service is what remembers that ID between runs (it's the
- *     thing storing "archived"/"pending" state), so it's expected to
- *     read the previous callback's `fileId` back out of its own state
- *     and include it as `previousFileId` on the next dispatch for that
- *     thread.
- *   - de03.pixeldrain.com is one of Pixeldrain's storage nodes, used
- *     here as the upload target directly (rather than the
- *     pixeldrain.com load balancer) — the base URL is overridable via
- *     PIXELDRAIN_API_BASE if that ever needs to change.
+ *     every re-archive would just pile up orphaned files on the
+ *     account. The Deno service is what remembers that ID between runs
+ *     (it's the thing storing "archived"/"pending" state), so it's
+ *     expected to read the previous callback's `fileId` back out of its
+ *     own state and include it as `previousFileId` on the next dispatch
+ *     for that thread.
+ *   - Deleting is a separate call, on Gofile's regular API host rather
+ *     than the upload one: DELETE https://api.gofile.io/contents with a
+ *     JSON body of {"contentsId": "<id>"}, same bearer token. Gofile
+ *     folds some errors into a 200 response (an `error-*` `status`
+ *     field rather than a non-2xx status code), so the delete helper
+ *     below checks both.
+ *   - If GOFILE_FOLDER_ID is unset, every upload with no folderId lands
+ *     in a brand-new folder Gofile auto-creates at the account root —
+ *     deleting the file by its own id afterwards leaves that now-empty
+ *     folder behind. Set GOFILE_FOLDER_ID to a folder UUID (from
+ *     Gofile's createFolder endpoint, or a folder you made in the web
+ *     UI) to upload everything into one place instead and avoid that
+ *     debris.
+ *   - upload.gofile.io auto-picks the closest of Gofile's regional
+ *     upload servers; GOFILE_UPLOAD_BASE_URL overrides this to pin a
+ *     specific one (e.g. https://upload-ap-tyo.gofile.io/uploadfile) if
+ *     that's ever worth doing.
  *
  * This still runs as a one-shot CLI script inside a GitHub Actions job,
  * triggered per-batch by a `repository_dispatch` event that the Deno
@@ -41,7 +60,7 @@
  * JSON result to a callback URL (the Deno service's own
  * /thread-complete endpoint — see deno-service/catalog.ts), authenticated
  * with a shared secret. The Deno service uses that callback to update
- * its "archived"/"pending" state (including the Pixeldrain file ID, so
+ * its "archived"/"pending" state (including the Gofile file ID, so
  * it can be passed back in as `previousFileId` next time this thread is
  * re-archived).
  *
@@ -57,7 +76,7 @@
  *     "maxAssetsPerThread": 40,       // optional
  *     "maxAssetBytes": 0,             // optional
  *     "offloadUploaders": [{ "prefix": "fu", "baseUrl": "..." }],
- *     "previousFileId": "abc123",     // optional — Pixeldrain file ID from
+ *     "previousFileId": "abc123",     // optional — Gofile content id from
  *                                     // the last time this thread was
  *                                     // archived, to be deleted before the
  *                                     // new upload
@@ -70,14 +89,26 @@
  * never needs to parse individual env vars per field.
  *
  * Required environment variables:
- *   PIXELDRAIN_API_KEY — Pixeldrain API key (from
- *                      https://pixeldrain.com/user/api_keys), sent as
- *                      HTTP Basic auth on every Pixeldrain API call.
+ *   GOFILE_API_TOKEN  — Gofile account token (from your profile page at
+ *                      https://gofile.io/myProfile — create a free
+ *                      account first if you don't have one), sent as
+ *                      `Authorization: Bearer ...` on every Gofile API
+ *                      call (upload, and delete-previous-file on
+ *                      re-archive). A guest/throwaway account's token
+ *                      also works, but a real account is what makes
+ *                      re-archiving able to find and delete its own
+ *                      earlier uploads later.
  *   CALLBACK_SECRET   — must match the Deno service's CALLBACK_SECRET;
  *                      sent as `Authorization: Bearer ...` on the
  *                      callback POST.
  * Optional environment variables:
- *   PIXELDRAIN_API_BASE — defaults to "https://de03.pixeldrain.com/api".
+ *   GOFILE_UPLOAD_BASE_URL — defaults to
+ *                      "https://upload.gofile.io/uploadfile". Override
+ *                      to pin a specific regional upload server instead
+ *                      of Gofile's automatic closest-region pick.
+ *   GOFILE_FOLDER_ID  — UUID of a Gofile folder to upload every archive
+ *                      into. Unset means each upload gets its own new
+ *                      folder at the account root (see above).
  */
 
 // ---------- Charset handling ----------
@@ -557,23 +588,28 @@ async function buildZip(entries: ZipEntry[]) {
   return result;
 }
 
-// ---------- Pixeldrain upload (replaces GitHub Releases) ----------
+// ---------- Gofile upload (replaces GitHub Releases, then Pixeldrain) ----------
 //
-// Pixeldrain's upload API is a plain PUT of the file bytes, authenticated
-// with HTTP Basic auth (empty username, API key as the password) — no
-// GITHUB_TOKEN / GITHUB_REPOSITORY needed anymore, just PIXELDRAIN_API_KEY.
+// Gofile's upload API takes the file as multipart/form-data, authenticated
+// with `Authorization: Bearer <token>` — no GITHUB_TOKEN / GITHUB_REPOSITORY
+// needed, just GOFILE_API_TOKEN.
 //
 // Unlike a GitHub release asset (keyed by name on a release) or an R2
-// object (keyed by an arbitrary key), a Pixeldrain upload always gets a
-// fresh, random file ID — the "name" in the upload URL is just filename
-// metadata, not a slot you can overwrite. So re-archiving a thread with
-// more replies than last time means explicitly deleting the *previous*
-// Pixeldrain file (by ID) rather than relying on the upload itself to
-// replace anything. That previous ID has to come in on the payload as
-// `previousFileId`, since this script has no state of its own — the Deno
-// service is what remembers it between runs.
+// object (keyed by an arbitrary key), a Gofile upload always gets a
+// fresh, random content id — the filename given in the upload is just
+// display metadata, not a slot you can overwrite. So re-archiving a
+// thread with more replies than last time means explicitly deleting the
+// *previous* Gofile content (by id) rather than relying on the upload
+// itself to replace anything. That previous id has to come in on the
+// payload as `previousFileId`, since this script has no state of its
+// own — the Deno service is what remembers it between runs.
+//
+// Deletion is a separate endpoint on a different host
+// (api.gofile.io/contents, vs. upload.gofile.io/uploadfile for
+// uploading) — both use the same bearer token.
 
-const DEFAULT_PIXELDRAIN_API_BASE = "https://de03.pixeldrain.com/api";
+const DEFAULT_GOFILE_UPLOAD_URL = "https://upload.gofile.io/uploadfile";
+const GOFILE_CONTENTS_URL = "https://api.gofile.io/contents";
 
 function requireEnv(name: string): string {
   const v = Deno.env.get(name);
@@ -585,45 +621,50 @@ function boardSlug(boardHost: string, boardPath: string): string {
   return `${boardHost}${boardPath}`.replace(/[^a-z0-9]+/gi, "_");
 }
 
-function pixeldrainHeaders(apiKey: string, extra: Record<string, string> = {}): Record<string, string> {
-  // HTTP Basic auth with an empty username; the API key is the password.
-  const basic = btoa(`:${apiKey}`);
+function gofileAuthHeader(apiToken: string, extra: Record<string, string> = {}): Record<string, string> {
   return {
-    Authorization: `Basic ${basic}`,
+    Authorization: `Bearer ${apiToken}`,
     ...extra,
   };
 }
 
-interface PixeldrainUploadResult {
+interface GofileUploadResult {
   id: string;
+  downloadPage: string;
 }
 
 /**
- * PUT the zip bytes to Pixeldrain under `name` (used only as display
- * filename metadata — it has no bearing on the returned file ID).
- * Throws on any non-2xx response, including Pixeldrain's documented
- * { success: false, value, message } error shape.
+ * POST the zip bytes to Gofile as multipart/form-data under `name`
+ * (used only as display filename metadata — it has no bearing on the
+ * returned content id). `folderId`, when set, uploads into that
+ * existing folder instead of Gofile auto-creating a new one. Throws on
+ * any non-2xx response, or a 2xx response whose body's `status` isn't
+ * "ok" — Gofile's documented error shape is { "status": "error-..." }.
  *
- * FIX: the body is read exactly once, as text, before attempting to
- * parse it as JSON. The previous version called res.json() first and,
- * on parse failure, fell back to res.text() on the SAME Response object
- * for error detail — but a Response's body stream can only be read
- * once. That second read threw ("body already used"), got swallowed by
- * its own .catch(() => ""), and produced an empty error detail no
- * matter what actually went wrong (e.g. "failed: 201 " with nothing
- * after it). Reading as text first and JSON.parse()-ing that text keeps
- * the raw body available for diagnostics either way.
+ * Keeps the same single-read-then-parse discipline the Pixeldrain
+ * version of this function was fixed to use: the body is read exactly
+ * once, as text, then JSON.parse()-ed from that text, so error
+ * diagnostics stay available even when parsing fails, instead of a
+ * second read throwing ("body already used") on an already-consumed
+ * Response body stream.
  */
-async function uploadToPixeldrain(
-  apiBase: string,
+async function uploadToGofile(
+  uploadUrl: string,
   name: string,
   data: Uint8Array,
-  apiKey: string
-): Promise<PixeldrainUploadResult> {
-  const res = await fetch(`${apiBase}/file/${encodeURIComponent(name)}`, {
-    method: "PUT",
-    headers: pixeldrainHeaders(apiKey, { "Content-Type": "application/zip" }),
-    body: data,
+  apiToken: string,
+  folderId: string | undefined
+): Promise<GofileUploadResult> {
+  const form = new FormData();
+  form.append("file", new Blob([data], { type: "application/zip" }), name);
+  if (folderId) form.append("folderId", folderId);
+
+  const res = await fetch(uploadUrl, {
+    method: "POST",
+    // No Content-Type here — fetch sets the multipart boundary itself
+    // from the FormData body.
+    headers: gofileAuthHeader(apiToken),
+    body: form,
   });
 
   const text = await res.text().catch(() => "");
@@ -634,32 +675,46 @@ async function uploadToPixeldrain(
     json = null;
   }
 
-  if (!res.ok || !json?.success) {
-    const detail = json
-      ? `${json.value ?? ""} ${json.message ?? ""}`.trim()
-      : text.slice(0, 300); // raw body, in case it wasn't JSON at all
-    throw new Error(`pixeldrain upload of ${name} failed: ${res.status} ${detail || "(empty response body)"}`);
+  if (!res.ok || json?.status !== "ok") {
+    const detail = json?.status ?? text.slice(0, 300); // raw body, in case it wasn't JSON at all
+    throw new Error(`gofile upload of ${name} failed: ${res.status} ${detail || "(empty response body)"}`);
   }
-  return { id: json.id };
+  return { id: json.data.id, downloadPage: json.data.downloadPage };
 }
 
 /**
- * Best-effort delete of a previously-uploaded Pixeldrain file (used when
+ * Best-effort delete of a previously-uploaded Gofile file (used when
  * re-archiving a thread that grew more replies). Not fatal if it fails —
  * the new upload should still go ahead, we just log and move on, leaving
  * a stale file on the account rather than losing the re-archive entirely.
+ *
+ * Gofile sometimes answers with HTTP 200 but an `error-*` `status` in
+ * the body (see the module doc comment), so both are checked; a 404 or
+ * an `error-notFound` status just means the content is already gone,
+ * which isn't an error worth logging.
  */
-async function deletePixeldrainFile(apiBase: string, fileId: string, apiKey: string): Promise<void> {
+async function deleteGofileContent(contentId: string, apiToken: string): Promise<void> {
   try {
-    const res = await fetch(`${apiBase}/file/${encodeURIComponent(fileId)}`, {
+    const res = await fetch(GOFILE_CONTENTS_URL, {
       method: "DELETE",
-      headers: pixeldrainHeaders(apiKey),
+      headers: gofileAuthHeader(apiToken, { "Content-Type": "application/json" }),
+      body: JSON.stringify({ contentsId: contentId }),
     });
-    if (!res.ok && res.status !== 404) {
-      console.error(`delete of previous pixeldrain file ${fileId} failed: ${res.status} ${await res.text().catch(() => "")}`);
+
+    const text = await res.text().catch(() => "");
+    let json: any = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch (_e) {
+      json = null;
+    }
+
+    if (res.status === 404 || json?.status === "error-notFound") return;
+    if (!res.ok || json?.status !== "ok") {
+      console.error(`delete of previous gofile content ${contentId} failed: ${res.status} ${json?.status ?? text.slice(0, 300)}`);
     }
   } catch (e) {
-    console.error(`delete of previous pixeldrain file ${fileId} threw: ${e}`);
+    console.error(`delete of previous gofile content ${contentId} threw: ${e}`);
   }
 }
 
@@ -673,7 +728,7 @@ interface ArchiveRequest {
   maxAssetsPerThread?: number;
   maxAssetBytes?: number;
   offloadUploaders?: OffloadUploader[];
-  /** Pixeldrain file ID from a previous archive of this same thread, to delete before uploading the new one. */
+  /** Gofile content id from a previous archive of this same thread, to delete before uploading the new one. */
   previousFileId?: string;
 }
 
@@ -752,20 +807,26 @@ async function archiveThread(req: ArchiveRequest) {
 
   const zipBytes = await buildZip(zipEntries);
 
-  // ---- was: GitHub Release asset upload; now: Pixeldrain file upload ----
-  const apiKey = requireEnv("PIXELDRAIN_API_KEY");
-  const apiBase = Deno.env.get("PIXELDRAIN_API_BASE") || DEFAULT_PIXELDRAIN_API_BASE;
+  // ---- was: GitHub Release asset upload, then Pixeldrain; now: Gofile ----
+  const apiToken = requireEnv("GOFILE_API_TOKEN");
+  const uploadUrl = Deno.env.get("GOFILE_UPLOAD_BASE_URL") || DEFAULT_GOFILE_UPLOAD_URL;
+  const folderId = Deno.env.get("GOFILE_FOLDER_ID") || undefined;
   const tag = boardSlug(boardHost, boardPath);
   const assetName = `${tag}_${threadId}.zip`;
 
   if (previousFileId) {
     // Re-archiving this thread — the old upload has no stable slot to
-    // overwrite on Pixeldrain, so clear it out first.
-    await deletePixeldrainFile(apiBase, previousFileId, apiKey);
+    // overwrite on Gofile either, so clear it out first.
+    await deleteGofileContent(previousFileId, apiToken);
   }
 
-  const { id: fileId } = await uploadToPixeldrain(apiBase, assetName, zipBytes, apiKey);
-  const assetUrl = `https://pixeldrain.com/api/file/${fileId}?download`;
+  const { id: fileId, downloadPage } = await uploadToGofile(uploadUrl, assetName, zipBytes, apiToken, folderId);
+  // Gofile's upload response gives back a download PAGE (an HTML landing
+  // page a person clicks through), not a raw fetchable file link the way
+  // Pixeldrain's `?download`-suffixed URL was — a script trying to GET
+  // this URL directly will get HTML back, not the zip. A raw link needs
+  // Gofile's Premium-only /contents/{id}/directlinks endpoint.
+  const assetUrl = downloadPage;
 
   return {
     ok: true,
@@ -804,7 +865,7 @@ function readPayload(): JobPayload {
  * Report the outcome back to the Deno service so it can update its
  * archived/pending state (now stored in this repo — see
  * deno-service/catalog.ts's GitHub-backed state helpers), including the
- * new Pixeldrain `fileId` so it can be passed back in as
+ * new Gofile `fileId` so it can be passed back in as
  * `previousFileId` the next time this thread is re-archived. Best-effort:
  * if this fails, the job still exits with the correct status code so the
  * Actions run itself shows success/failure, but the Deno service's state
