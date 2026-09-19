@@ -1,68 +1,23 @@
 /**
  * Futaba Channel thread archiver — GitHub Actions half.
  *
- * ARCHITECTURE CHANGE (GitHub Releases -> Pixeldrain -> Gofile):
+ * ARCHITECTURE CHANGE FROM THE DENO DEPLOY VERSION:
  *
- * This used to upload the finished ZIP as a GitHub Release asset (one
- * release per board, tagged with that board's slug; one asset per
- * thread, named "<threadId>.zip"), then briefly as a Pixeldrain upload.
- * Both have been dropped as the storage target. The ZIP now goes to
- * Gofile instead, via Gofile's HTTP API:
- *   - POST https://upload.gofile.io/uploadfile as multipart/form-data
- *     (field "file", plus an optional "folderId" — see GOFILE_FOLDER_ID
- *     below), authenticated with `Authorization: Bearer <token>`.
- *     Uploads land under the account that owns the token; without a
- *     token Gofile would silently create a throwaway guest account
- *     instead, which is why GOFILE_API_TOKEN is required rather than
- *     optional here. Success responses look like
- *     { "status": "ok", "data": { "id": "...", "downloadPage": "...",
- *     ... } } — `data.id` is Gofile's own random content ID, NOT
- *     something we get to choose, so exactly like the Pixeldrain setup
- *     this replaced, there is no stable "slot" a re-upload can just
- *     overwrite.
- *   - Because of that, re-archiving a thread (more replies than last
- *     time) needs the *previous* Gofile content ID handed back to us
- *     (see `previousFileId` on the payload) so the stale file can be
- *     explicitly DELETEd before the new one is uploaded — otherwise
- *     every re-archive would just pile up orphaned files on the
- *     account. The Deno service is what remembers that ID between runs
- *     (it's the thing storing "archived"/"pending" state), so it's
- *     expected to read the previous callback's `fileId` back out of its
- *     own state and include it as `previousFileId` on the next dispatch
- *     for that thread.
- *   - Deleting is a separate call, on Gofile's regular API host rather
- *     than the upload one: DELETE https://api.gofile.io/contents with a
- *     JSON body of {"contentsId": "<id>"}, same bearer token. Gofile
- *     folds some errors into a 200 response (an `error-*` `status`
- *     field rather than a non-2xx status code), so the delete helper
- *     below checks both.
- *   - If GOFILE_FOLDER_ID is unset, every upload with no folderId lands
- *     in a brand-new folder Gofile auto-creates at the account root —
- *     deleting the file by its own id afterwards leaves that now-empty
- *     folder behind. Set GOFILE_FOLDER_ID to a folder UUID (from
- *     Gofile's createFolder endpoint, or a folder you made in the web
- *     UI) to upload everything into one place instead and avoid that
- *     debris.
- *   - upload.gofile.io auto-picks the closest of Gofile's regional
- *     upload servers; GOFILE_UPLOAD_BASE_URL overrides this to pin a
- *     specific one (e.g. https://upload-ap-tyo.gofile.io/uploadfile) if
- *     that's ever worth doing.
+ * This used to be a `Deno.serve` HTTP server on Deno Deploy that the
+ * Cloudflare Worker called with `POST /archive` and awaited synchronously.
+ * It's now a one-shot CLI script meant to run inside a GitHub Actions job,
+ * triggered per-thread by a `repository_dispatch` event that the Worker
+ * sends (see cf-worker/index.js's dispatchArchiveThreadViaGitHubActions).
  *
- * This still runs as a one-shot CLI script inside a GitHub Actions job,
- * triggered per-batch by a `repository_dispatch` event that the Deno
- * service sends (see deno-service/catalog.ts's
- * dispatchArchiveBatchViaGitHubActions, and .github/workflows/
- * archive-thread.yml, which fans a batch back out into one matrix job
- * per thread).
- *
- * Because GitHub's repository_dispatch API is fire-and-forget, this
+ * Because GitHub's repository_dispatch API is fire-and-forget (it just
+ * confirms the event was accepted, with no way to await a result), this
  * script reports back over HTTP itself once it's done: it POSTs a small
- * JSON result to a callback URL (the Deno service's own
- * /thread-complete endpoint — see deno-service/catalog.ts), authenticated
- * with a shared secret. The Deno service uses that callback to update
- * its "archived"/"pending" state (including the Gofile file ID, so
- * it can be passed back in as `previousFileId` next time this thread is
- * re-archived).
+ * JSON result to a callback URL (the Worker's /thread-complete endpoint),
+ * authenticated with a shared secret. The Worker uses that callback to
+ * update its "archived"/"pending" state blobs — see cf-worker/index.js.
+ *
+ * Everything else — HTML fetching, offload-uploader resolution, ZIP
+ * building, R2 upload — is unchanged from the Deno Deploy version.
  *
  * INPUT: a single JSON blob in the PAYLOAD_JSON environment variable,
  * shaped like:
@@ -71,45 +26,26 @@
  *     "boardHost": "may.2chan.net",
  *     "boardPath": "/b/",
  *     "replies": 42,                  // echoed back in the callback so the
- *                                     // Deno service can record the right count
+ *                                     // Worker can record the right count
  *     "userAgent": "...",             // optional
  *     "maxAssetsPerThread": 40,       // optional
  *     "maxAssetBytes": 0,             // optional
  *     "offloadUploaders": [{ "prefix": "fu", "baseUrl": "..." }],
- *     "previousFileId": "abc123",     // optional — Gofile content id from
- *                                     // the last time this thread was
- *                                     // archived, to be deleted before the
- *                                     // new upload
- *     "callbackUrl": "https://your-deno-service.deno.dev/thread-complete"
+ *     "callbackUrl": "https://your-worker.workers.dev/thread-complete"
  *   }
- * The Deno service builds this payload and sends it as GitHub's
- * `client_payload`; the workflow YAML
- * (.github/workflows/archive-thread.yml) forwards it into PAYLOAD_JSON
- * verbatim via `toJson(github.event.client_payload)`, so this script
- * never needs to parse individual env vars per field.
+ * The Worker builds this payload and sends it as GitHub's `client_payload`;
+ * the workflow YAML (.github/workflows/archive-thread.yml) forwards it
+ * into PAYLOAD_JSON verbatim via `toJson(github.event.client_payload)`, so
+ * this script never needs to parse individual env vars per field.
  *
- * Required environment variables:
- *   GOFILE_API_TOKEN  — Gofile account token (from your profile page at
- *                      https://gofile.io/myProfile — create a free
- *                      account first if you don't have one), sent as
- *                      `Authorization: Bearer ...` on every Gofile API
- *                      call (upload, and delete-previous-file on
- *                      re-archive). A guest/throwaway account's token
- *                      also works, but a real account is what makes
- *                      re-archiving able to find and delete its own
- *                      earlier uploads later.
- *   CALLBACK_SECRET   — must match the Deno service's CALLBACK_SECRET;
- *                      sent as `Authorization: Bearer ...` on the
- *                      callback POST.
- * Optional environment variables:
- *   GOFILE_UPLOAD_BASE_URL — defaults to
- *                      "https://upload.gofile.io/uploadfile". Override
- *                      to pin a specific regional upload server instead
- *                      of Gofile's automatic closest-region pick.
- *   GOFILE_FOLDER_ID  — UUID of a Gofile folder to upload every archive
- *                      into. Unset means each upload gets its own new
- *                      folder at the account root (see above).
+ * Required environment variables (set as GitHub Actions repo/environment
+ * secrets, NOT included in the payload):
+ *   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME
+ *   CALLBACK_SECRET — must match the Worker's W_SHARED_SECRET; sent as
+ *                     `Authorization: Bearer ...` on the callback POST.
  */
+
+import { AwsClient } from "npm:aws4fetch@1.0.20";
 
 // ---------- Charset handling ----------
 
@@ -241,9 +177,9 @@ function extractStylesheetUrls(html: string) {
 }
 
 /**
- * NOTE ON THE CSS CACHE: an earlier Deno Deploy version cached each
- * board's shared stylesheet in a module-level Map so a warm isolate
- * could skip re-fetching it across several calls in a row. That trick
+ * NOTE ON THE CSS CACHE: the Deno Deploy version cached each board's
+ * shared stylesheet in a module-level Map so a warm isolate could skip
+ * re-fetching it across several /archive calls in a row. That trick
  * doesn't apply here — each GitHub Actions job is a fresh process (a new
  * VM), so there's no "warm instance" to carry a cache between threads.
  * The stylesheet is simply fetched fresh, once, per job. If this ever
@@ -266,7 +202,7 @@ interface OffloadUploader {
  * uploader's base URL prepended to actually be fetchable. Scans the raw
  * HTML/text for these patterns (not just tag attributes) since they can
  * appear as plain text in a post body too. `uploaders` is whatever list
- * the Deno service sent in this request — this function has no built-in
+ * the Worker sent in this request — this function has no built-in
  * knowledge of which prefixes exist.
  */
 function extractOffloadedAssetUrls(html: string, uploaders: OffloadUploader[]) {
@@ -431,8 +367,9 @@ const CRC_TABLE = (() => {
 // "Slicing-by-8": precompute 7 more tables so the main loop consumes 8
 // bytes per iteration instead of 1. GitHub Actions runners give a full
 // 2-core VM per job with no CPU-time metering, so this is even less of a
-// concern than on a serverless platform — kept as-is since it's still
-// cheap insurance on large multi-MB video buffers.
+// concern than it was on Deno Deploy — kept as-is since it's still cheap
+// insurance on large multi-MB video buffers and there's no reason to rip
+// it out.
 const CRC_TABLES = (() => {
   const tables = [CRC_TABLE];
   for (let t = 1; t < 8; t++) {
@@ -588,28 +525,7 @@ async function buildZip(entries: ZipEntry[]) {
   return result;
 }
 
-// ---------- Gofile upload (replaces GitHub Releases, then Pixeldrain) ----------
-//
-// Gofile's upload API takes the file as multipart/form-data, authenticated
-// with `Authorization: Bearer <token>` — no GITHUB_TOKEN / GITHUB_REPOSITORY
-// needed, just GOFILE_API_TOKEN.
-//
-// Unlike a GitHub release asset (keyed by name on a release) or an R2
-// object (keyed by an arbitrary key), a Gofile upload always gets a
-// fresh, random content id — the filename given in the upload is just
-// display metadata, not a slot you can overwrite. So re-archiving a
-// thread with more replies than last time means explicitly deleting the
-// *previous* Gofile content (by id) rather than relying on the upload
-// itself to replace anything. That previous id has to come in on the
-// payload as `previousFileId`, since this script has no state of its
-// own — the Deno service is what remembers it between runs.
-//
-// Deletion is a separate endpoint on a different host
-// (api.gofile.io/contents, vs. upload.gofile.io/uploadfile for
-// uploading) — both use the same bearer token.
-
-const DEFAULT_GOFILE_UPLOAD_URL = "https://upload.gofile.io/uploadfile";
-const GOFILE_CONTENTS_URL = "https://api.gofile.io/contents";
+// ---------- R2 upload (S3-compatible API, direct from Deno) ----------
 
 function requireEnv(name: string): string {
   const v = Deno.env.get(name);
@@ -617,108 +533,41 @@ function requireEnv(name: string): string {
   return v;
 }
 
-function boardSlug(boardHost: string, boardPath: string): string {
-  return `${boardHost}${boardPath}`.replace(/[^a-z0-9]+/gi, "_");
+let r2Client: InstanceType<typeof AwsClient> | null = null;
+function getR2Client() {
+  if (!r2Client) {
+    r2Client = new AwsClient({
+      accessKeyId: requireEnv("R2_ACCESS_KEY_ID"),
+      secretAccessKey: requireEnv("R2_SECRET_ACCESS_KEY"),
+      service: "s3",
+      region: "auto",
+    });
+  }
+  return r2Client;
 }
 
-function gofileAuthHeader(apiToken: string, extra: Record<string, string> = {}): Record<string, string> {
-  return {
-    Authorization: `Bearer ${apiToken}`,
-    ...extra,
-  };
-}
+/** PUT an object straight into R2 via its S3-compatible endpoint. */
+async function putToR2(key: string, body: Uint8Array, contentType: string) {
+  const accountId = requireEnv("R2_ACCOUNT_ID");
+  const bucket = requireEnv("R2_BUCKET_NAME");
+  // Encode each path segment but keep the "/" separators the key relies on.
+  const encodedKey = key.split("/").map(encodeURIComponent).join("/");
+  const url = `https://${accountId}.r2.cloudflarestorage.com/${bucket}/${encodedKey}`;
 
-interface GofileUploadResult {
-  id: string;
-  downloadPage: string;
-}
-
-/**
- * POST the zip bytes to Gofile as multipart/form-data under `name`
- * (used only as display filename metadata — it has no bearing on the
- * returned content id). `folderId`, when set, uploads into that
- * existing folder instead of Gofile auto-creating a new one. Throws on
- * any non-2xx response, or a 2xx response whose body's `status` isn't
- * "ok" — Gofile's documented error shape is { "status": "error-..." }.
- *
- * Keeps the same single-read-then-parse discipline the Pixeldrain
- * version of this function was fixed to use: the body is read exactly
- * once, as text, then JSON.parse()-ed from that text, so error
- * diagnostics stay available even when parsing fails, instead of a
- * second read throwing ("body already used") on an already-consumed
- * Response body stream.
- */
-async function uploadToGofile(
-  uploadUrl: string,
-  name: string,
-  data: Uint8Array,
-  apiToken: string,
-  folderId: string | undefined
-): Promise<GofileUploadResult> {
-  const form = new FormData();
-  form.append("file", new Blob([data], { type: "application/zip" }), name);
-  if (folderId) form.append("folderId", folderId);
-
-  const res = await fetch(uploadUrl, {
-    method: "POST",
-    // No Content-Type here — fetch sets the multipart boundary itself
-    // from the FormData body.
-    headers: gofileAuthHeader(apiToken),
-    body: form,
+  const client = getR2Client();
+  const res = await client.fetch(url, {
+    method: "PUT",
+    body,
+    headers: { "Content-Type": contentType },
   });
 
-  const text = await res.text().catch(() => "");
-  let json: any = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch (_e) {
-    json = null;
-  }
-
-  if (!res.ok || json?.status !== "ok") {
-    const detail = json?.status ?? text.slice(0, 300); // raw body, in case it wasn't JSON at all
-    throw new Error(`gofile upload of ${name} failed: ${res.status} ${detail || "(empty response body)"}`);
-  }
-  return { id: json.data.id, downloadPage: json.data.downloadPage };
-}
-
-/**
- * Best-effort delete of a previously-uploaded Gofile file (used when
- * re-archiving a thread that grew more replies). Not fatal if it fails —
- * the new upload should still go ahead, we just log and move on, leaving
- * a stale file on the account rather than losing the re-archive entirely.
- *
- * Gofile sometimes answers with HTTP 200 but an `error-*` `status` in
- * the body (see the module doc comment), so both are checked; a 404 or
- * an `error-notFound` status just means the content is already gone,
- * which isn't an error worth logging.
- */
-async function deleteGofileContent(contentId: string, apiToken: string): Promise<void> {
-  try {
-    const res = await fetch(GOFILE_CONTENTS_URL, {
-      method: "DELETE",
-      headers: gofileAuthHeader(apiToken, { "Content-Type": "application/json" }),
-      body: JSON.stringify({ contentsId: contentId }),
-    });
-
+  if (!res.ok) {
     const text = await res.text().catch(() => "");
-    let json: any = null;
-    try {
-      json = text ? JSON.parse(text) : null;
-    } catch (_e) {
-      json = null;
-    }
-
-    if (res.status === 404 || json?.status === "error-notFound") return;
-    if (!res.ok || json?.status !== "ok") {
-      console.error(`delete of previous gofile content ${contentId} failed: ${res.status} ${json?.status ?? text.slice(0, 300)}`);
-    }
-  } catch (e) {
-    console.error(`delete of previous gofile content ${contentId} threw: ${e}`);
+    throw new Error(`R2 PUT failed (${res.status}): ${text.slice(0, 500)}`);
   }
 }
 
-// ---------- Core per-thread archive logic ----------
+// ---------- Core per-thread archive logic (unchanged from Deno Deploy) ----------
 
 interface ArchiveRequest {
   threadId: string;
@@ -728,8 +577,6 @@ interface ArchiveRequest {
   maxAssetsPerThread?: number;
   maxAssetBytes?: number;
   offloadUploaders?: OffloadUploader[];
-  /** Gofile content id from a previous archive of this same thread, to delete before uploading the new one. */
-  previousFileId?: string;
 }
 
 async function archiveThread(req: ArchiveRequest) {
@@ -741,7 +588,6 @@ async function archiveThread(req: ArchiveRequest) {
     maxAssetsPerThread = 40,
     maxAssetBytes = 0,
     offloadUploaders = [],
-    previousFileId,
   } = req;
 
   const pageUrl = `https://${boardHost}${boardPath}res/${threadId}.htm`;
@@ -754,7 +600,7 @@ async function archiveThread(req: ArchiveRequest) {
   const { text: rawHtml } = decodeBuffer(buffer, res.headers.get("content-type"));
 
   // Fetch bare "<prefix>NNNN.ext" mentions too (including ones only in
-  // plain post text), for every uploader the Deno service told us about.
+  // plain post text), for every uploader the Worker told us about.
   const offloadedUrls = extractOffloadedAssetUrls(rawHtml, offloadUploaders);
 
   // Resolve bare filenames appearing in src/href to their real absolute
@@ -807,32 +653,12 @@ async function archiveThread(req: ArchiveRequest) {
 
   const zipBytes = await buildZip(zipEntries);
 
-  // ---- was: GitHub Release asset upload, then Pixeldrain; now: Gofile ----
-  const apiToken = requireEnv("GOFILE_API_TOKEN");
-  const uploadUrl = Deno.env.get("GOFILE_UPLOAD_BASE_URL") || DEFAULT_GOFILE_UPLOAD_URL;
-  const folderId = Deno.env.get("GOFILE_FOLDER_ID") || undefined;
-  const tag = boardSlug(boardHost, boardPath);
-  const assetName = `${tag}_${threadId}.zip`;
-
-  if (previousFileId) {
-    // Re-archiving this thread — the old upload has no stable slot to
-    // overwrite on Gofile either, so clear it out first.
-    await deleteGofileContent(previousFileId, apiToken);
-  }
-
-  const { id: fileId, downloadPage } = await uploadToGofile(uploadUrl, assetName, zipBytes, apiToken, folderId);
-  // Gofile's upload response gives back a download PAGE (an HTML landing
-  // page a person clicks through), not a raw fetchable file link the way
-  // Pixeldrain's `?download`-suffixed URL was — a script trying to GET
-  // this URL directly will get HTML back, not the zip. A raw link needs
-  // Gofile's Premium-only /contents/{id}/directlinks endpoint.
-  const assetUrl = downloadPage;
+  const key = `${boardHost}${boardPath}${threadId}.zip`.replace(/\/+/g, "/");
+  await putToR2(key, zipBytes, "application/zip");
 
   return {
     ok: true,
-    key: `${tag}/${assetName}`, // kept for callback-shape compatibility with deno-service/catalog.ts
-    fileId,
-    assetUrl,
+    key,
     assetCount: fetched.length,
   };
 }
@@ -862,16 +688,12 @@ function readPayload(): JobPayload {
 }
 
 /**
- * Report the outcome back to the Deno service so it can update its
- * archived/pending state (now stored in this repo — see
- * deno-service/catalog.ts's GitHub-backed state helpers), including the
- * new Gofile `fileId` so it can be passed back in as
- * `previousFileId` the next time this thread is re-archived. Best-effort:
- * if this fails, the job still exits with the correct status code so the
- * Actions run itself shows success/failure, but the Deno service's state
- * won't be updated until the thread is re-picked-up (it'll fall out of
- * "pending" after PENDING_TIMEOUT_MS on that side and get retried on a
- * later catalog pass).
+ * Report the outcome back to the Worker so it can update its archived/
+ * pending state. Best-effort: if this fails, the job still exits with the
+ * correct status code so the Actions run itself shows success/failure,
+ * but the Worker's state won't be updated until the thread is re-picked-up
+ * (it'll fall out of "pending" after PENDING_TIMEOUT_MS on the Worker
+ * side and get retried on a later catalog pass).
  */
 async function sendCallback(callbackUrl: string, payload: Record<string, unknown>) {
   const secret = Deno.env.get("CALLBACK_SECRET");
@@ -896,7 +718,7 @@ async function main() {
   const payload = readPayload();
   const { threadId, boardHost, boardPath, replies, callbackUrl } = payload;
 
-  let result: { ok: boolean; reason?: string; key?: string; fileId?: string; assetUrl?: string; assetCount?: number };
+  let result: { ok: boolean; reason?: string; key?: string; assetCount?: number };
   try {
     result = await archiveThread(payload);
   } catch (e) {
@@ -908,7 +730,7 @@ async function main() {
   if (callbackUrl) {
     await sendCallback(callbackUrl, { threadId, boardHost, boardPath, replies, ...result });
   } else {
-    console.error("No callbackUrl in payload — Deno service state will not be updated for this thread.");
+    console.error("No callbackUrl in payload — Worker state will not be updated for this thread.");
   }
 
   // Non-zero exit on failure so the Actions run itself is visibly red in
@@ -916,6 +738,14 @@ async function main() {
   Deno.exit(result.ok ? 0 : 1);
 }
 
+// FIX: main() was defined but never invoked, so the script loaded, did
+// nothing, and exited 0 — no fetch, no ZIP, no R2 upload, no callback,
+// and no error either, since nothing ever ran to throw one. This is the
+// actual call that kicks everything off. Wrapped in .catch() rather than
+// called bare so that a rejection happening before/outside the internal
+// try/catch (e.g. readPayload() throwing on missing/invalid PAYLOAD_JSON)
+// still gets logged and still exits non-zero, instead of the job
+// potentially reporting a false green run.
 main().catch((e) => {
   console.error(`Unhandled error in main(): ${e}`);
   Deno.exit(1);
