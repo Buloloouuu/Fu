@@ -86,7 +86,7 @@ function forceUtf8Meta(html: string) {
 
 // ---------- Asset extraction ----------
 
-const ASSET_HREF_EXTENSIONS = /\.(jpe?g|png|gif|webp|bmp|webm|mp4|txt)(\?|#|$)/i;
+const ASSET_HREF_EXTENSIONS = /\.(jpe?g|png|gif|webp|bmp|webm|mp4|txt|mp3|mov|ogg|pdf|mht|html|zip)(\?|#|$)/i;
 
 /**
  * Pull out URLs that are actual content assets — post images, video,
@@ -190,7 +190,7 @@ function extractStylesheetUrls(html: string) {
 
 // ---------- Offload uploaders (generic — config comes from the payload) ----------
 
-const OFFLOAD_EXTENSIONS = "jpe?g|png|gif|webp|bmp|webm|mp4|txt";
+const OFFLOAD_EXTENSIONS = "jpe?g|png|gif|webp|bmp|webm|mp4|txt|mp3|mov|ogg|pdf|mht|html|zip";
 
 interface OffloadUploader {
   prefix: string; // e.g. "fu", "f3"
@@ -638,7 +638,7 @@ async function archiveThread(req: ArchiveRequest) {
     zipEntries.push({
       name: `assets/${localName}`,
       data: new Uint8Array(asset.buffer),
-      compress: /\.txt$/i.test(localName) || stylesheetUrls.has(asset.raw),
+      compress: /\.(txt|html|mht)$/i.test(localName) || stylesheetUrls.has(asset.raw),
     });
   }
   // Point each skipped thumbnail at the same local asset as the full-size
