@@ -1,43 +1,25 @@
 name: Archive Futaba Thread
-# Triggered by the Deno Deploy service via GitHub's repository_dispatch
-# API (see deno-service/catalog.ts's dispatchArchiveBatchViaGitHubActions
-# — this used to be sent by a Cloudflare Worker; Cloudflare has been
-# dropped from this project entirely, the Deno service now owns
-# scheduling AND dispatch on its own). ONE event carries a BATCH of
-# threads under client_payload.threads = [{threadId, replies}, ...], so
-# this workflow fans that array back out into one matrix job per thread.
+# Triggered by the Cloudflare Worker via GitHub's repository_dispatch API
+# (see cf-worker/index.js, dispatchArchiveBatchViaGitHubActions). ONE event
+# now carries a BATCH of threads under client_payload.threads =
+# [{threadId, replies}, ...] rather than a single thread, so this workflow
+# fans that array back out into one matrix job per thread.
 #
 # workflow_dispatch is still wired up for manual testing from the Actions
 # tab, and accepts EITHER shape in the `payload` input:
-#   - a full batch payload, same shape as the Deno service sends. Each
-#     thread entry MAY carry its own "previousFileId" (the Gofile
-#     content id from that thread's last archive, if any) so
-#     archive-thread.ts can delete the stale upload before archiving it
-#     again:
-#       {"threads":[{"threadId":"...","replies":0,"previousFileId":"abc123"}],
-#        "boardHost":"...","boardPath":"...","userAgent":"...",
-#        "maxAssetsPerThread":40,"maxAssetBytes":0,
-#        "offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
-#        "callbackUrl":"https://your-deno-service.deno.dev/thread-complete"}
+#   - a full batch payload, same shape as the Worker sends:
+#       {"threads":[{"threadId":"...","replies":0}],"boardHost":"...",
+#        "boardPath":"...","userAgent":"...","maxAssetsPerThread":40,
+#        "maxAssetBytes":0,"offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
+#        "callbackUrl":"https://your-worker.workers.dev/thread-complete"}
 #   - or the older single-thread shape, for a quick one-off test:
 #       {"threadId":"...","boardHost":"...","boardPath":"...","replies":0,
-#        "previousFileId":"abc123","userAgent":"...","maxAssetsPerThread":40,
-#        "maxAssetBytes":0,"offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
-#        "callbackUrl":"https://your-deno-service.deno.dev/thread-complete"}
+#        "userAgent":"...","maxAssetsPerThread":40,"maxAssetBytes":0,
+#        "offloadUploaders":[{"prefix":"fu","baseUrl":"..."}],
+#        "callbackUrl":"https://your-worker.workers.dev/thread-complete"}
 # The "prepare" job below detects which shape it got and normalizes both
 # into the same {threads, shared} split, so "archive" only ever has to
 # handle one case.
-#
-# ARCHITECTURE CHANGE (GitHub Releases -> Pixeldrain -> Gofile):
-# archive-thread.ts no longer uploads the finished ZIP as a GitHub
-# Release asset, and no longer uploads it to Pixeldrain either. It now
-# POSTs the ZIP straight to Gofile's upload API
-# (https://upload.gofile.io/uploadfile by default) as multipart/form-data,
-# authenticated with a Gofile account token (GOFILE_API_TOKEN secret)
-# rather than the job's auto-issued GITHUB_TOKEN. Since nothing in this
-# job creates GitHub releases or uploads release assets anymore, the job
-# no longer needs `contents: write` — GITHUB_TOKEN keeps its default
-# read-only permissions.
 on:
   repository_dispatch:
     types: [archive-thread]
@@ -45,18 +27,17 @@ on:
     inputs:
       payload:
         description: >
-          JSON payload — either a full batch (same shape as the Deno
-          service's client_payload, with a "threads" array) or a
-          single-thread payload (top-level "threadId"/"replies") for a
-          quick manual test.
+          JSON payload — either a full batch (same shape as the Worker's
+          client_payload, with a "threads" array) or a single-thread
+          payload (top-level "threadId"/"replies") for a quick manual test.
         required: true
 
 jobs:
   # Normalizes both trigger types / both payload shapes into:
   #   - threads_matrix: a compact JSON array of {threadId, replies}
   #   - shared: everything else (boardHost, boardPath, userAgent,
-  #     maxAssetsPerThread, maxAssetBytes, offloadUploaders, callbackUrl,
-  #     previousFileId), common to every thread in this run
+  #     maxAssetsPerThread, maxAssetBytes, offloadUploaders, callbackUrl),
+  #     common to every thread in this run
   # so the "archive" job's matrix and per-thread payload assembly stay
   # identical regardless of how this run was triggered.
   prepare:
@@ -82,19 +63,15 @@ jobs:
           jq empty payload.json
 
           if jq -e 'has("threads")' payload.json > /dev/null; then
-            # Batch shape (from the Deno service, or a manually pasted batch).
-            # previousFileId travels per-thread (it's the Gofile content id
-            # from that specific thread's last archive, not something every
-            # thread in the batch shares), so it's kept alongside threadId/
-            # replies here instead of falling into "shared".
-            jq -c '[.threads[] | {threadId, replies, previousFileId}]' payload.json > threads.json
+            # Batch shape (from the Worker, or a manually pasted batch).
+            jq -c '[.threads[] | {threadId, replies}]' payload.json > threads.json
             jq -c 'del(.threads)' payload.json > shared.json
           else
             # Legacy single-thread shape (manual test) — wrap it into a
             # one-entry "threads" array so the matrix below is identical
             # either way.
-            jq -c '[{threadId, replies, previousFileId}]' payload.json > threads.json
-            jq -c 'del(.threadId, .replies, .previousFileId)' payload.json > shared.json
+            jq -c '[{threadId, replies}]' payload.json > threads.json
+            jq -c 'del(.threadId, .replies)' payload.json > shared.json
           fi
 
           echo "threads_matrix=$(cat threads.json)" >> "$GITHUB_OUTPUT"
@@ -127,42 +104,32 @@ jobs:
           deno-version: v2.x
       # Merges this matrix entry's {threadId, replies} back into the
       # shared fields from "prepare", producing exactly the same
-      # single-thread PAYLOAD_JSON shape archive-thread.ts already expects.
+      # single-thread PAYLOAD_JSON shape archive-thread.ts already expects
+      # — that script needed no changes for batching.
       - name: Build payload for this thread
         run: |
           echo '${{ needs.prepare.outputs.shared }}' | jq \
             --arg threadId "${{ matrix.threadId }}" \
             --argjson replies ${{ matrix.replies }} \
-            --arg previousFileId "${{ matrix.previousFileId }}" \
-            '. + {threadId: $threadId, replies: $replies}
-               + (if $previousFileId == "" then {} else {previousFileId: $previousFileId} end)' > payload.json
+            '. + {threadId: $threadId, replies: $replies}' > payload.json
           jq empty payload.json
       - name: Archive thread
         env:
           PAYLOAD_JSON_FILE: payload.json
-          # Gofile account token, sent as `Authorization: Bearer ...` on
-          # every Gofile API call archive-thread.ts makes (upload, and
-          # delete-previous-file on re-archive). Was Pixeldrain's
-          # PIXELDRAIN_API_KEY before Pixeldrain was dropped as the
-          # upload target; before that, GITHUB_TOKEN / GITHUB_REPOSITORY
-          # for GitHub Releases — none of those are needed anymore.
-          GOFILE_API_TOKEN: ${{ secrets.GOFILE_API_TOKEN }}
-          # Optional override of the Gofile upload server; defaults to
-          # https://upload.gofile.io/uploadfile (auto-picks the closest
-          # region) inside archive-thread.ts if unset.
-          GOFILE_UPLOAD_BASE_URL: ${{ vars.GOFILE_UPLOAD_BASE_URL }}
-          # Optional: UUID of a Gofile folder to upload every archive
-          # into. Unset means each upload gets its own new folder at the
-          # account root — see archive-thread.ts's module doc comment.
-          GOFILE_FOLDER_ID: ${{ vars.GOFILE_FOLDER_ID }}
-          # Must match the Deno service's own CALLBACK_SECRET — used to
-          # authenticate the POST to the Deno service's /thread-complete
-          # endpoint once this job finishes.
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          CALLBACK_SECRET: ${{ secrets.W_SHARED_SECRET }}
         run: |
           export PAYLOAD_JSON="$(cat "$PAYLOAD_JSON_FILE")"
-          # -A (allow-all): this runner is a fresh, disposable VM per job,
-          # so there's no reason to hand-pick permissions — Deno needs
-          # net (fetch), env (reading PAYLOAD_JSON/GOFILE_API_TOKEN/etc),
-          # and read/write (module cache for any npm: imports) at minimum.
+          # FIX: was "--allow-net --allow-env", which is not enough to
+          # resolve the "npm:aws4fetch" import — Deno needs to write the
+          # downloaded package into its local cache (and read it back),
+          # so it also needs --allow-read/--allow-write (and --allow-sys
+          # for a couple of runtime checks aws4fetch/its deps make). This
+          # was silently swallowing the whole run: the tarball would
+          # download, then the import would throw a permission error
+          # before main() ever got a chance to run. Runner is a fresh,
+          # disposable VM per job, so -A (allow-all) is fine here.
           deno run -A deno-service/archive-thread.ts
