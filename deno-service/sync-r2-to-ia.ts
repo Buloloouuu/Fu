@@ -463,7 +463,7 @@ async function runSampleAndSync(env: Env): Promise<SyncSummary> {
   // NOTE: preserving the original default of 45 (the doc comment in the
   // very first version of this script claimed 30, but the code always
   // used `|| 45` — keeping the real behavior, not the stale comment).
-  const limit = parseInt(env.SAMPLE_LIMIT ?? "", 10) || 45;
+  const limit = parseInt(env.SAMPLE_LIMIT ?? "", 10) || 75;
   const deleteAfterSync = env.DELETE_FROM_R2_AFTER_SYNC !== "false";
 
   const allObjects = await listAllObjects(env);
