@@ -20,6 +20,19 @@
  * (grouping object keys by their directory prefix), so nothing needs to
  * be hardcoded as fallback volume shifts over time.
  *
+ * R2 CLASS A OP REDUCTION (listing):
+ * Every archived thread leaves a permanent _state/archived/<slug>/<id>.json
+ * object behind, so the _state/ tree grows without bound. Listing the
+ * whole bucket used to page through ALL of it on every run (1000 keys per
+ * page, one Class A ListObjectsV2 op per page) just to throw those keys
+ * away in discoverFolders(). The first page of the listing now passes
+ * start-after=STATE_SKIP_START_AFTER ("_state0") so R2 begins the
+ * listing just past the whole _state/ tree — see the comment on that
+ * constant for why that works and what it depends on (every real archive
+ * key must start with a LOWERCASE hostname, so board hosts must stay
+ * lowercase). In a healthy IA-first setup this is normally a single List
+ * call per run.
+ *
  * ARCHITECTURE CHANGE FROM THE DENO DEPLOY VERSION:
  * This used to be a `Deno.serve` HTTP server (triggered by a GET to
  * /sample-sync, protected by AUTH_TOKEN) with an optional `Deno.cron`
@@ -199,18 +212,44 @@ function decodeXmlEntities(s: string): string {
     .replace(/&apos;/g, "'");
 }
 
+/**
+ * CHANGE (Class A op reduction): where the ListObjectsV2 listing starts.
+ *
+ * R2/S3 list keys in lexicographic (byte) order. Real archive keys start
+ * with a LOWERCASE hostname ("dat.2chan.net/..."), i.e. a first byte of
+ * 0x61 or higher, while every state key starts with "_state/" (first
+ * byte '_' = 0x5F, and '/' = 0x2F is the byte right after "_state").
+ * "_state0" ('0' = 0x30 is the character immediately after '/') is
+ * therefore the first possible key that sorts AFTER every "_state/..."
+ * key, so start-after=_state0 makes the listing begin just past the
+ * whole state tree instead of paging through it.
+ *
+ * This depends on every archive key sorting after "_state0", i.e.
+ * starting with a lowercase letter — which is why board hosts must be
+ * lowercase (the old capital-M "May.2chan.net" board entry would have
+ * sorted before it and been skipped).
+ *
+ * `start-after` only matters on the first page; later pages are driven
+ * by the continuation-token, which already encodes the position.
+ */
+const STATE_SKIP_START_AFTER = "_state0";
+
 async function listAllObjects(env: Env): Promise<R2ObjectSummary[]> {
   const { client, endpoint } = r2Client(env);
   const all: R2ObjectSummary[] = [];
   let token: string | undefined;
   let page = 0;
 
-  log(`Listing objects in bucket "${env.R2_BUCKET_NAME}"...`);
+  log(`Listing objects in bucket "${env.R2_BUCKET_NAME}" (starting after "${STATE_SKIP_START_AFTER}", skipping _state/ tree)...`);
   do {
     page++;
     const url = new URL(`${endpoint}/${env.R2_BUCKET_NAME}`);
     url.searchParams.set("list-type", "2");
-    if (token) url.searchParams.set("continuation-token", token);
+    if (token) {
+      url.searchParams.set("continuation-token", token);
+    } else {
+      url.searchParams.set("start-after", STATE_SKIP_START_AFTER);
+    }
 
     const res = await client.fetch(url.toString());
     if (!res.ok) {
@@ -271,6 +310,9 @@ function discoverFolders(objects: R2ObjectSummary[]): Map<string, R2ObjectSummar
   let ignoredState = 0;
   let ignoredRootLevel = 0;
 
+  // The start-after listing above should never return _state/ keys, so
+  // ignoredState is expected to be 0 — this check stays as a safety net
+  // so a state file can never be mistaken for an archive and pushed to IA.
   for (const obj of objects) {
     if (obj.key.startsWith("_state/") || obj.key.includes("/_state/")) {
       ignoredState++;
